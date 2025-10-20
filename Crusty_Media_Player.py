@@ -6,7 +6,8 @@ import subprocess
 from PyQt6.QtCore import Qt, QUrl, QTimer 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSlider, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QFileDialog, QLabel)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtMultimediaWidgets import QVideoWidget 
+from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtGui import QShortcut
 
 # Force ffmpeg-python to use bundled ffmpeg.exe 
 ffmpeg_path = os.path.join(os.path.dirname(__file__), 'ffmpeg.exe') 
@@ -16,10 +17,8 @@ if os.path.exists(ffmpeg_path):
 class MediaPlayer(QMainWindow): 
     def __init__(self): 
         super().__init__() 
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint) 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) 
-        self.setWindowTitle("Crusty Media Player 0.2.0") 
         self.setGeometry(200, 100, 1600, 900) 
 
         screen = QApplication.primaryScreen().geometry()
@@ -49,7 +48,7 @@ class MediaPlayer(QMainWindow):
         # Custom title bar 
         self.title_bar = QWidget() 
         self.title_bar.setFixedHeight(40) 
-        self.title_label = QLabel("Crusty Media Player 0.2.0") 
+        self.title_label = QLabel("Crusty Media Player 0.2.1") 
         self.title_label.setStyleSheet("font-weight: bold; color: white; padding-left: 10px;") 
         self.close_button = QPushButton("✕") 
         self.close_button.setFixedSize(30, 30) 
@@ -123,7 +122,13 @@ class MediaPlayer(QMainWindow):
         
         container = QWidget() 
         container.setLayout(main_layout) 
-        self.setCentralWidget(container) 
+        self.setCentralWidget(container)
+        
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFocus()
+
+        space_shortcut = QShortcut(Qt.Key.Key_Space, self)
+        space_shortcut.activated.connect(self.toggle_play_pause)
         
         # Connections 
         self.open_button.clicked.connect(self.load_video) 
@@ -202,6 +207,10 @@ class MediaPlayer(QMainWindow):
         
         # Update timeline 
         self.media_player.durationChanged.connect(self.update_duration)
+
+        if self.media_player.duration() > 0:
+            self.update_duration(self.media_player.duration())
+
         
     def toggle_play_pause(self):
         # Toggle between playing and pausing the media
@@ -213,13 +222,6 @@ class MediaPlayer(QMainWindow):
             self.pause()
             self.play_button.setText("Play")
             self.is_playing = False
-
-    def keyPressEvent(self, event):
-        # Spacebar toggles play/pause
-        if event.key() == Qt.Key.Key_Space:
-            self.toggle_play_pause()
-        else:
-            super().keyPressEvent(event)
         
     def play(self): 
         # Play video and both audio tracks 
@@ -227,7 +229,8 @@ class MediaPlayer(QMainWindow):
         self.audio_player1.play() 
         if len(self.temp_files) > 1: 
             self.audio_player2.play() 
-            self.timer.start() 
+        
+        self.timer.start() 
             
     def pause(self): 
         # Pause video and both audio tracks. 
@@ -235,7 +238,8 @@ class MediaPlayer(QMainWindow):
         self.audio_player1.pause() 
         if len(self.temp_files) > 1: 
             self.audio_player2.pause() 
-            self.timer.stop() 
+            
+        self.timer.stop() 
 
     def stop(self): 
         # Stop video and both audio tracks. 
@@ -243,13 +247,15 @@ class MediaPlayer(QMainWindow):
         self.audio_player1.stop() 
         if len(self.temp_files) > 1: 
             self.audio_player2.stop() 
-            self.timer.stop()
+            
+        self.timer.stop()
             
         self.is_playing = False
             
     def update_duration(self, duration): 
         # Update timeline slider range. 
-        self.timeline_slider.setRange(0, duration) 
+        self.timeline_slider.setRange(0, duration)
+        self.timeline_label.setText(f"00:00 / {self.update_label(duration)}")
         
     def update_timeline(self): 
         # Update timeline slider position. 
@@ -260,14 +266,14 @@ class MediaPlayer(QMainWindow):
         self.timeline_slider.blockSignals(True) 
         self.timeline_slider.setValue(self.media_player.position()) 
         self.timeline_slider.blockSignals(False) 
+
+        self.timeline_label.setText(f"{self.update_label(position)} / {self.update_label(duration)}")
         
-    def update_label(ms): 
+    def update_label(self, ms): 
         seconds = ms // 1000 
         minutes = seconds // 60 
         seconds %= 60 
         return f"{minutes:02d}:{seconds:02d}" 
-    
-        self.timeline_label.setText(f"{update_label(position)} / {update_label(duration)}") 
     
     #----------------------------Scrubbing Logic----------------------------# 
     def start_scrub(self): 
