@@ -3,6 +3,7 @@ import os
 import tempfile
 import ffmpeg
 import subprocess
+import json
 
 from PyQt6.QtCore import (
     Qt, QUrl, QTimer, QPoint, QPropertyAnimation, QEvent, QEasingCurve
@@ -318,10 +319,31 @@ class MediaPlayer(QMainWindow):
 
         # Detect number of audio streams using ffprobe
         try:
-            probe = ffmpeg.probe(file_path)
-            audio_streams = [s for s in probe['streams'] if s['codec_type'] == 'audio']
+            # Prepare command
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "json",
+                file_path
+            ]
+
+            # Run ffprobe with hidden window
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+
+            # Parse output
+            probe_data = json.loads(result.stdout)
+            audio_streams = probe_data.get("streams", [])
             num_audio_tracks = len(audio_streams)
-        except ffmpeg.Error as e:
+
+        except Exception as e:
             self.info_label.setText("Error reading media file.")
             return
         
