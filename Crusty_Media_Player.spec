@@ -4,7 +4,7 @@
 a = Analysis(
     ['Crusty_Media_Player.py'],
     pathex=[],
-    binaries=[('ffmpeg\\ffmpeg.exe', '.')],
+    binaries=[('ffmpeg\\ffmpeg.exe', '.'), ('ffmpeg\\ffprobe.exe', '.')],
     datas=[],
     hiddenimports=['ffmpeg'],
     hookspath=[],
