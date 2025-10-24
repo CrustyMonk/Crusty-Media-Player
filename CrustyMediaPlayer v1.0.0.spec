@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[('ffmpeg\\ffmpeg.exe', '.'), ('ffmpeg\\ffprobe.exe', '.')],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['ffmpeg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Crusty_Media_Player',
+    name='CrustyMediaPlayer v1.0.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -32,6 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='version.txt',
     icon=['icon\\Crusty_Icon.ico'],
 )
 coll = COLLECT(
@@ -41,5 +42,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Crusty_Media_Player',
+    name='CrustyMediaPlayer v1.0.0',
 )

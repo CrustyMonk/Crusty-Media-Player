@@ -4,6 +4,7 @@ import tempfile
 import ffmpeg
 import subprocess
 import json
+from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QUrl, QTimer, QPoint, QPropertyAnimation, QEvent, QEasingCurve, pyqtSignal, QObject, QRectF
@@ -17,7 +18,9 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtGui import QShortcut, QCursor, QPainter
 
 # Adding light mode/dark mode
-SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
+appdata_dir = Path(os.getenv('APPDATA')) / "CrustyMediaPlayer"
+appdata_dir.mkdir(exist_ok=True)
+SETTINGS_FILE = appdata_dir / "settings.json"
 
 def load_theme():
     if os.path.exists(SETTINGS_FILE):
@@ -174,17 +177,18 @@ BORDER_SIZE = 8
 
 # Force ffmpeg-python to use bundled ffmpeg.exe 
 # Note: This path logic assumes an environment where ffmpeg.exe is adjacent to the script.
-ffmpeg_path = os.path.join(os.path.dirname(__file__), 'ffmpeg.exe') 
-if os.path.exists(ffmpeg_path): 
-    # Use the absolute path logic more robustly
-    os.environ["PATH"] = os.path.dirname(ffmpeg_path) + os.pathsep + os.environ["PATH"] 
+if getattr(sys, 'frozen', False):
+    # Running as compiled .exe
+    base_path = sys._MEIPASS
+else:
+    # Running as script
+    base_path = os.path.dirname(__file__)
 
-# Force ffmpeg-python to use bundled ffprobe.exe 
-# Note: This path logic assumes an environment where ffprobe.exe is adjacent to the script.
-ffprobe_path = os.path.join(os.path.dirname(__file__), 'ffprobe.exe')
-if os.path.exists(ffprobe_path): 
-    # Use the absolute path logic more robustly
-    os.environ["PATH"] = os.path.dirname(ffprobe_path) + os.pathsep + os.environ["PATH"] 
+ffmpeg_path = os.path.join(base_path, 'ffmpeg.exe')
+ffprobe_path = os.path.join(base_path, 'ffprobe.exe')
+
+# Add to PATH
+os.environ["PATH"] = base_path + os.pathsep + os.environ.get("PATH", "") 
 
 # ------------------------------ Creating Video Manager ------------------------------ #
 class VideoPlayer(QWidget):
