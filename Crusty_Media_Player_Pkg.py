@@ -18,9 +18,14 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtGui import QShortcut, QCursor, QPainter
 
 # Adding light mode/dark mode
-appdata_dir = Path(os.getenv('APPDATA')) / "CrustyMediaPlayer"
-appdata_dir.mkdir(exist_ok=True)
-SETTINGS_FILE = appdata_dir / "settings.json"
+def get_settings():
+    app_name = "CrustyMediaPlayer"
+    appdata = os.getenv("APPDATA")
+    settings_dir = os.path.join(appdata, app_name)
+    os.makedirs(settings_dir, exist_ok=True)
+    return os.path.join(settings_dir, "settings.json")
+
+SETTINGS_FILE = get_settings()
 
 def load_theme():
     if os.path.exists(SETTINGS_FILE):
@@ -513,7 +518,7 @@ class MainWindow(QMainWindow):
         self.title_bar = QWidget() 
         self.title_bar.setMinimumHeight(0)
         self.title_bar.setMaximumHeight(30) 
-        self.title_label = QLabel("Crusty Media Player v1.0.0")
+        self.title_label = QLabel("Crusty Media Player v1.0.1")
         self.title_label.setObjectName("titlelabel") 
         
         self.settings_button = QToolButton()
@@ -1000,10 +1005,10 @@ class MainWindow(QMainWindow):
     # ----- Settings menu ----- #
     def apply_theme(self, theme):
         # Apply the chosen theme and remember it
-        if theme == "light":
-            QApplication.instance().setStyleSheet(LIGHT_THEME)
-        else:
+        if theme == "dark":
             QApplication.instance().setStyleSheet(DARK_THEME)
+        else:
+            QApplication.instance().setStyleSheet(LIGHT_THEME)
         save_theme(theme)
 
     # ----- Cleanup ----- #
