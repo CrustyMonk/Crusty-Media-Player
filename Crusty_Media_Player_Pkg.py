@@ -5,19 +5,21 @@ import ffmpeg
 import subprocess
 import json
 from pathlib import Path
+from functools import partial
 
 from PyQt6.QtCore import (
     Qt, QUrl, QTimer, QPoint, QPropertyAnimation, QEvent, QEasingCurve, pyqtSignal, QObject, QRectF
 )
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QSlider, QWidget, QPushButton, QVBoxLayout, 
-    QHBoxLayout, QFileDialog, QLabel, QSizePolicy, QMenu, QToolButton
+    QApplication, QMainWindow, QSlider, QWidget, QPushButton, QVBoxLayout,
+    QHBoxLayout, QFileDialog, QLabel, QSizePolicy, QMenu, QToolButton, QScrollArea
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtGui import QShortcut, QCursor, QPainter
 
-# Adding light mode/dark mode
+# ----------------------------- Settings & Themes ----------------------------- #
+
 def get_settings():
     app_name = "CrustyMediaPlayer"
     appdata = os.getenv("APPDATA")
@@ -177,25 +179,22 @@ QPushButton#closebutton:hover {
 }
 """
 
-# The width in pixels where the window detects a resize drag on the border.
+# Border detection size
 BORDER_SIZE = 8
 
-# Force ffmpeg-python to use bundled ffmpeg.exe 
-# Note: This path logic assumes an environment where ffmpeg.exe is adjacent to the script.
+# Force ffmpeg-python to use bundled ffmpeg.exe if present
 if getattr(sys, 'frozen', False):
-    # Running as compiled .exe
     base_path = sys._MEIPASS
 else:
-    # Running as script
     base_path = os.path.dirname(__file__)
 
 ffmpeg_path = os.path.join(base_path, 'ffmpeg.exe')
 ffprobe_path = os.path.join(base_path, 'ffprobe.exe')
 
-# Add to PATH
-os.environ["PATH"] = base_path + os.pathsep + os.environ.get("PATH", "") 
+# Add to PATH so subprocess ffmpeg/ffprobe calls find them
+os.environ["PATH"] = base_path + os.pathsep + os.environ.get("PATH", "")
 
-# ------------------------------ Creating Video Manager ------------------------------ #
+# ------------------------------ Video Player ------------------------------ #
 class VideoPlayer(QWidget):
     position_changed = pyqtSignal(int)
     duration_changed = pyqtSignal(int)
@@ -216,7 +215,6 @@ class VideoPlayer(QWidget):
 
         self.media_player.positionChanged.connect(lambda pos: self.position_changed.emit(int(pos)))
         self.media_player.durationChanged.connect(lambda dur: self.duration_changed.emit(int(dur)))
-
         self.media_player.playbackStateChanged.connect(self.playback_state_changed)
 
     def playback_state_changed(self, state):
@@ -250,35 +248,38 @@ class VideoPlayer(QWidget):
     def set_pos(self, pos):
         self.media_player.setPosition(pos)
 
-# ------------------------------ Creating Audio Manager ------------------------------ #
-
+# ------------------------------ Audio Manager (supports N tracks) ------------------------------ #
 class AudioManager(QObject):
     audio_tracks_detected = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.audio_player1 = QMediaPlayer() 
-        self.audio_output1 = QAudioOutput() 
-        self.audio_player1.setAudioOutput(self.audio_output1) 
-        self.audio_output1.setVolume(0.25) 
-
-        self.audio_player2 = QMediaPlayer() 
-        self.audio_output2 = QAudioOutput() 
-        self.audio_player2.setAudioOutput(self.audio_output2) 
-        self.audio_output2.setVolume(0.25)
-
+        # dynamic lists for arbitrary number of tracks
+        self.audio_players = []   # list of QMediaPlayer
+        self.audio_outputs = []   # list of QAudioOutput
         self.temp_files = []
+        self.ffmpeg_subprocesses = []
 
         self.ffprobe = "ffprobe"
 
     def cleanup_temp_files(self):
-        for f in self.temp_files: 
-            try: 
-                os.unlink(f) 
-            except Exception as e: 
-                pass 
+        # stop players first
+        for p in self.audio_players:
+            try:
+                p.stop()
+            except Exception:
+                pass
+        # remove temporary files
+        for f in self.temp_files:
+            try:
+                os.unlink(f)
+            except Exception:
+                pass
         self.temp_files = []
+        # clear players/outputs
+        self.audio_players = []
+        self.audio_outputs = []
 
     def detect_audio_tracks(self, file_path: str) -> int:
         # Use ffprobe to detect number of audio streams
@@ -310,17 +311,20 @@ class AudioManager(QObject):
         except Exception:
             return 0
 
-    def extract_audio_tracks(self, file_path: str, max_tracks=2):
-        # Extract up to `max_tracks` audio streams as WAV files, boosting volume like original
+    def extract_audio_tracks(self, file_path: str, max_tracks: int = None):
+        # Extract all audio tracks (or up to max_tracks if provided) to WAV temp files. Returns list of temp file paths.
         self.cleanup_temp_files()
         num_audio_tracks = self.detect_audio_tracks(file_path)
         if num_audio_tracks == 0:
             return []
 
-        for i in range(min(num_audio_tracks, max_tracks)):
+        total_to_extract = num_audio_tracks if max_tracks is None else min(num_audio_tracks, max_tracks)
+
+        for i in range(total_to_extract):
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
             temp_file.close()
             try:
+                # Use ffmpeg-python to extract audio stream i, convert to 2ch 44100Hz WAV and boost gain
                 cmd = (
                     ffmpeg
                     .input(file_path)
@@ -328,57 +332,105 @@ class AudioManager(QObject):
                     .overwrite_output()
                     .compile()
                 )
-                subprocess.run(
-                    cmd,
+                proc = subprocess.Popen(
+                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
+                proc.wait()
                 self.temp_files.append(temp_file.name)
-            except ffmpeg.Error:
-                # stop if extraction fails
+            except Exception:
+                # stop if extraction fails for any stream
                 break
+
+        # create QMediaPlayers and QAudioOutputs dynamically for each extracted file
+        self.audio_players = []
+        self.audio_outputs = []
+
+        for path in self.temp_files:
+            player = QMediaPlayer()
+            audio_out = QAudioOutput()
+            player.setAudioOutput(audio_out)
+            # set an initial comfortable volume (0-1)
+            audio_out.setVolume(0.25)
+            player.setSource(QUrl.fromLocalFile(path))
+            self.audio_players.append(player)
+            self.audio_outputs.append(audio_out)
 
         return self.temp_files
 
     def set_audio_src(self):
-        if len(self.temp_files) >= 1:
-            self.audio_player1.setSource(QUrl.fromLocalFile(self.temp_files[0]))
-        if len(self.temp_files) >= 2:
-            self.audio_player2.setSource(QUrl.fromLocalFile(self.temp_files[1]))
+        # Already set during extract (setSource). Keep for compatibility if needed.
+        for i, path in enumerate(self.temp_files):
+            try:
+                self.audio_players[i].setSource(QUrl.fromLocalFile(path))
+            except Exception:
+                pass
 
     def play(self):
-        self.audio_player1.play()
-        if len(self.temp_files) > 1:
-            self.audio_player2.play()
+        for p in self.audio_players:
+            try:
+                p.play()
+            except Exception:
+                pass
 
     def pause(self):
-        self.audio_player1.pause()
-        if len(self.temp_files) > 1:
-            self.audio_player2.pause()
+        for p in self.audio_players:
+            try:
+                p.pause()
+            except Exception:
+                pass
 
     def stop(self):
-        self.audio_player1.stop()
-        if len(self.temp_files) > 1:
-            self.audio_player2.stop()
-    
+        for p in self.audio_players:
+            try:
+                p.stop()
+            except Exception:
+                pass
+
     def set_pos(self, pos):
-        self.audio_player1.setPosition(pos)
-        if len(self.temp_files) > 1:
-            self.audio_player2.setPosition(pos)
+        # pos in milliseconds
+        for p in self.audio_players:
+            try:
+                p.setPosition(pos)
+            except Exception:
+                pass
 
-    def set_track1_vol(self, gain: float):
-        self.audio_output1.setVolume(gain)
-
-    def set_track2_vol(self, gain: float):
-        self.audio_output2.setVolume(gain)
+    def set_track_vol(self, index: int, gain: float):
+        # gain in 0..1
+        if 0 <= index < len(self.audio_outputs):
+            try:
+                self.audio_outputs[index].setVolume(gain)
+            except Exception:
+                pass
 
     def cleanup_on_close(self):
-        self.stop()
-        self.cleanup_temp_files()
+        for p in getattr(self, "ffmpeg_processes", []):
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        self.ffmpeg_processes = []
 
-# ------------------------------ Creating Control Panel ------------------------------ #
+        for p in self.audio_players:
+            try:
+                p.stop()
+                p.setAudioOutput(None)
+                p.deleteLater()
+            except Exception:
+                pass
 
+        for out in self.audio_outputs:
+            try:
+                out.deleteLater()
+            except Exception:
+                pass
+
+        self.audio_players = []
+        self.audio_outputs = []
+
+# ------------------------------ Control Panel (dynamic track controls) ------------------------------ #
 class ControlPanel(QWidget):
     open_request = pyqtSignal()
     play_request = pyqtSignal()
@@ -386,55 +438,47 @@ class ControlPanel(QWidget):
     timeline_pressed = pyqtSignal()
     timeline_released = pyqtSignal()
     timeline_moved = pyqtSignal(int)
-    track1_vol_chg = pyqtSignal(int)
-    track2_vol_chg = pyqtSignal(int)
+    # unified signal: (track_index, value)
+    track_vol_chg = pyqtSignal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         # Control buttons
-        self.open_button = QPushButton("Open Media") 
-        self.play_button = QPushButton("Play") 
+        self.open_button = QPushButton("Open Media")
+        self.play_button = QPushButton("Play")
         self.stop_button = QPushButton("Stop")
         for btn in [self.open_button, self.play_button, self.stop_button]:
             btn.setMinimumHeight(30)
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         # Timeline slider
-        self.timeline_slider = QSlider(Qt.Orientation.Horizontal) 
+        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
         self.timeline_slider.setRange(0, 0)
         self.timeline_label = QLabel("00:00 / 00:00")
 
         # Info label
         self.info_label = QLabel("No File Loaded")
 
-        # Audio track 1
-        self.track1_label = QLabel("Track 1 Volume:")
-        self.track1_slider = QSlider(Qt.Orientation.Horizontal)
-        self.track1_slider.setRange(0, 100) 
-        self.track1_slider.setValue(25) # Default 25% value = 100% audio gain
-        self.track1_vol_label = QLabel("100%")
-
-        # Audio track 2
-        self.track2_label = QLabel("Track 2 Volume:")
-        self.track2_slider = QSlider(Qt.Orientation.Horizontal)
-        self.track2_slider.setRange(0, 100) 
-        self.track2_slider.setValue(25) # Default 25% value = 100% audio gain
-        self.track2_vol_label = QLabel("100%")
+        # The dynamic track controls area (scrollable if many tracks)
+        self.track_controls_area = QScrollArea()
+        self.track_controls_area.setWidgetResizable(True)
+        self.track_container = QWidget()
+        self.track_controls_layout = QVBoxLayout(self.track_container)
+        self.track_controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.track_controls_layout.setSpacing(6)
+        self.track_container.setLayout(self.track_controls_layout)
+        self.track_controls_area.setWidget(self.track_container)
 
         # ----- Layouts ----- #
-        controls_layout = QHBoxLayout() 
-        controls_layout.addWidget(self.open_button) 
-        controls_layout.addWidget(self.play_button) 
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(self.open_button)
+        controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.stop_button)
 
-        volume_controls = QHBoxLayout()
-        volume_controls.addWidget(self.track1_label)
-        volume_controls.addWidget(self.track1_slider)
-        volume_controls.addWidget(self.track1_vol_label) 
-        volume_controls.addWidget(self.track2_label)
-        volume_controls.addWidget(self.track2_slider)
-        volume_controls.addWidget(self.track2_vol_label) 
+        volume_container_layout = QVBoxLayout()
+        volume_container_layout.addWidget(QLabel("Audio Tracks:"))
+        volume_container_layout.addWidget(self.track_controls_area)
 
         timeline_layout = QHBoxLayout()
         timeline_layout.addWidget(self.timeline_label)
@@ -446,7 +490,7 @@ class ControlPanel(QWidget):
         main_layout.setSpacing(5)
         main_layout.addLayout(timeline_layout)
         main_layout.addWidget(self.info_label)
-        main_layout.addLayout(volume_controls)
+        main_layout.addLayout(volume_container_layout)
         main_layout.addLayout(controls_layout)
 
         # Connections
@@ -458,9 +502,61 @@ class ControlPanel(QWidget):
         self.timeline_slider.sliderReleased.connect(lambda: self.timeline_released.emit())
         self.timeline_slider.sliderMoved.connect(lambda pos: self.timeline_moved.emit(pos))
 
-        self.track1_slider.valueChanged.connect(lambda vol: self.track1_vol_chg.emit(vol))
-        self.track2_slider.valueChanged.connect(lambda vol: self.track2_vol_chg.emit(vol))
+        # internal storage of controls for label updates
+        self._track_widgets = []  # list of (label_widget, slider_widget, vol_label_widget)
 
+    def clear_track_controls(self):
+        # Remove existing controls
+        for i in reversed(range(self.track_controls_layout.count())):
+            item = self.track_controls_layout.itemAt(i)
+            if item:
+                w = item.widget()
+                if w:
+                    w.setParent(None)
+        self._track_widgets = []
+
+    def populate_track_controls(self, num_tracks: int):
+        
+        # Create N sliders/labels for audio tracks. Existing controls are cleared.
+        self.clear_track_controls()
+        for i in range(num_tracks):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            label = QLabel(f"Track {i+1} Volume:")
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(25)  # match your existing default
+            vol_label = QLabel("100%")
+
+            slider.valueChanged.connect(partial(self._on_track_slider_changed, i))
+            # Keep a reference for later updates
+            row_layout.addWidget(label)
+            row_layout.addWidget(slider)
+            row_layout.addWidget(vol_label)
+
+            self.track_controls_layout.addWidget(row)
+            self._track_widgets.append((label, slider, vol_label))
+
+        # If no tracks, show a small hint
+        if num_tracks == 0:
+            hint = QLabel("No audio tracks.")
+            self.track_controls_layout.addWidget(hint)
+
+    def _on_track_slider_changed(self, index: int, value: int):
+        # Mirror old display semantics: slider value * 4 = displayed percentage
+        display_percentage = value * 4
+        # update label
+        try:
+            _, _, vol_label = self._track_widgets[index]
+            vol_label.setText(f"{display_percentage}%")
+        except Exception:
+            pass
+        # emit unified signal
+        self.track_vol_chg.emit(index, value)
+
+    # convenience helpers used by MainWindow
     def set_timeline_range(self, maximum):
         self.timeline_slider.setRange(0, maximum)
 
@@ -475,35 +571,23 @@ class ControlPanel(QWidget):
     def set_info_text(self, text):
         self.info_label.setText(text)
 
-    def set_track1_vol_label(self, text):
-        self.track1_vol_label.setText(text)
+    def set_track_vol_label(self, index: int, text: str):
+        # set the small percent label for a given track index (if exists)
+        try:
+            _, _, vol_label = self._track_widgets[index]
+            vol_label.setText(text)
+        except Exception:
+            pass
 
-    def set_track2_vol_label(self,text):
-        self.track2_vol_label.setText(text)
-
-    def hide_track2_controls(self):
-        self.track2_label.hide()
-        self.track2_slider.hide()
-        self.track2_vol_label.hide()
-
-    def show_track2_controls(self):
-        self.track2_label.show()
-        self.track2_slider.show()
-        self.track2_vol_label.show()
-
-    def set_track1_label(self, text):
-        self.track1_label.setText(text)
-
-# ------------------------------- Creating Main Window ------------------------------- #
-
+# ------------------------------- Main Window ------------------------------- #
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         # ----- Window Setup ----- #
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint) 
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) 
-        self.setGeometry(200, 100, 1600, 900) 
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(200, 100, 1600, 900)
         screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
@@ -515,28 +599,28 @@ class MainWindow(QMainWindow):
         self.controls = ControlPanel(self)
 
         # Custom title bar
-        self.title_bar = QWidget() 
+        self.title_bar = QWidget()
         self.title_bar.setMinimumHeight(0)
-        self.title_bar.setMaximumHeight(30) 
-        self.title_label = QLabel("Crusty Media Player v1.0.1")
-        self.title_label.setObjectName("titlelabel") 
-        
+        self.title_bar.setMaximumHeight(30)
+        self.title_label = QLabel("Crusty Media Player v1.2.0")
+        self.title_label.setObjectName("titlelabel")
+
         self.settings_button = QToolButton()
         self.settings_button.setText("*")
         self.settings_button.setFixedSize(30, 30)
         self.settings_button.setObjectName("settingsbutton")
         self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.settings_button.setArrowType(Qt.ArrowType.NoArrow)
- 
+
         self.settings_menu = QMenu()
         self.settings_menu.addAction("Light Mode", lambda: self.apply_theme("light"))
         self.settings_menu.addAction("Dark Mode", lambda: self.apply_theme("dark"))
         self.settings_button.setMenu(self.settings_menu)
 
-        self.close_button = QPushButton("✕") 
+        self.close_button = QPushButton("✕")
         self.close_button.setFixedSize(30, 30)
-        self.close_button.setObjectName("closebutton") 
-        self.close_button.clicked.connect(self.close) 
+        self.close_button.setObjectName("closebutton")
+        self.close_button.clicked.connect(self.close)
 
         self.minimize_button = QPushButton("—")
         self.minimize_button.setFixedSize(30, 30)
@@ -549,8 +633,8 @@ class MainWindow(QMainWindow):
         self.maximize_button.clicked.connect(self.toggle_maximize)
 
         # ----- Layouts ----- #
-        title_layout = QHBoxLayout(self.title_bar) 
-        title_layout.addWidget(self.title_label) 
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.addWidget(self.title_label)
         title_layout.addStretch()
         title_layout.addWidget(self.settings_button)
         title_layout.addWidget(self.minimize_button)
@@ -564,15 +648,15 @@ class MainWindow(QMainWindow):
         video_layout.setSpacing(0)
         video_layout.addWidget(self.video)
 
-        main_layout = QVBoxLayout() 
+        main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        main_layout.addWidget(self.title_bar) 
-        main_layout.addWidget(video_container, stretch=1) 
+        main_layout.addWidget(self.title_bar)
+        main_layout.addWidget(video_container, stretch=1)
         main_layout.addWidget(self.controls)
 
-        container = QWidget() 
-        container.setLayout(main_layout) 
+        container = QWidget()
+        container.setLayout(main_layout)
         self.setCentralWidget(container)
 
         self.dragPos = QPoint()
@@ -581,12 +665,12 @@ class MainWindow(QMainWindow):
         self.controls_visible = True
 
         # ----- Animations ----- #
-        QApplication.processEvents() 
+        QApplication.processEvents()
         self.target_height = max(self.controls.sizeHint().height(), 60)
         self.controls.setMaximumHeight(self.target_height)
 
         self.animation = QPropertyAnimation(self.controls, b"maximumHeight")
-        self.animation.setDuration(350) # Animation duration in ms
+        self.animation.setDuration(350)
         self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
 
         self.title_visible = True
@@ -598,16 +682,16 @@ class MainWindow(QMainWindow):
         self.title_bar.setMaximumHeight(self.title_target_height)
 
         self.hide_timer = QTimer(self)
-        self.hide_timer.setInterval(3000) # Timer to hide controls in ms
+        self.hide_timer.setInterval(3000)
         self.hide_timer.timeout.connect(self.hide_controls)
 
         # ----- Mouse Tracking ----- #
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFocus()
-        self.setMouseTracking(True)                       
-        self.video.video_widget.setMouseTracking(True)          
-        self.controls.setMouseTracking(True)  
-        self.title_bar.setMouseTracking(True) 
+        self.setMouseTracking(True)
+        self.video.video_widget.setMouseTracking(True)
+        self.controls.setMouseTracking(True)
+        self.title_bar.setMouseTracking(True)
         QApplication.instance().installEventFilter(self)
 
         # ----- Space key for play/pause ----- #
@@ -615,8 +699,8 @@ class MainWindow(QMainWindow):
         space_shortcut.activated.connect(self.toggle_play_pause)
 
         # ----- Timer for timeline updates ----- #
-        self.timer = QTimer() 
-        self.timer.setInterval(50) 
+        self.timer = QTimer()
+        self.timer.setInterval(50)
         self.timer.timeout.connect(self.update_timeline)
 
         self.was_playing = False
@@ -630,8 +714,8 @@ class MainWindow(QMainWindow):
         self.controls.timeline_released.connect(self.end_scrub)
         self.controls.timeline_moved.connect(self.preview_seek_pos)
 
-        self.controls.track1_vol_chg.connect(self.set_track1_vol)
-        self.controls.track2_vol_chg.connect(self.set_track2_vol)
+        # unified track signal -> handler
+        self.controls.track_vol_chg.connect(self.set_track_vol)
 
         # ----- Connections to audio manager ----- #
         self.audio.audio_tracks_detected.connect(self.update_vol_ui)
@@ -641,7 +725,7 @@ class MainWindow(QMainWindow):
         self.video.duration_changed.connect(self.update_dur)
         self.video.state_changed.connect(self.vid_state_chg)
 
-        # ----- Event filder and control visibility ----- #
+    # ----- Event filter / UI hide logic ----- #
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseMove:
             self.reset_hide_timer()
@@ -670,7 +754,6 @@ class MainWindow(QMainWindow):
             self.controls_visible = True
 
         if not self.title_visible:
-            # Animate title bar
             self.title_animation.stop()
             self.title_animation.setStartValue(self.title_bar.maximumHeight())
             self.title_animation.setEndValue(self.title_target_height)
@@ -698,26 +781,29 @@ class MainWindow(QMainWindow):
         self.hide_timer.stop()
         self.setCursor(Qt.CursorShape.BlankCursor)
 
-    # ----- Volume UI ----- #
-    def set_track1_vol(self, value):
+    # ----- Volume UI handlers ----- #
+    def set_track_vol(self, index: int, value: int):
+        """
+        Unified handler for any track volume slider.
+        `value` is 0..100 slider; we convert to gain 0..1 for QAudioOutput.setVolume.
+        """
         gain = value / 100.0
         display_percentage = value * 4
-        self.audio.set_track1_vol(gain)
-        self.controls.set_track1_vol_label(f"{display_percentage}%")
-
-    def set_track2_vol(self, value):
-        gain = value / 100.0
-        display_percentage = value * 4
-        self.audio.set_track2_vol(gain)
-        self.controls.set_track2_vol_label(f"{display_percentage}%")
+        # Set audio manager volume for the given index
+        self.audio.set_track_vol(index, gain)
+        # Update the UI label for that track
+        self.controls.set_track_vol_label(index, f"{display_percentage}%")
 
     def update_vol_ui(self, num_audio_tracks):
+        # create dynamic controls for N tracks
+        self.controls.populate_track_controls(num_audio_tracks)
+        # adjust info text label naming for single track
         if num_audio_tracks == 1:
-            self.controls.hide_track2_controls()
-            self.controls.set_track1_label("Volume:")
-        else:
-            self.controls.show_track2_controls()
-            self.controls.set_track1_label("Track 1 Volume:")
+            try:
+                label_widget, _, _ = self.controls._track_widgets[0]
+                label_widget.setText("Volume:")
+            except Exception:
+                pass
 
     # ----- Loading media and control ----- #
     def get_video_resolution(self, file_path):
@@ -737,7 +823,7 @@ class MainWindow(QMainWindow):
             return width, height
         except Exception:
             return 1280, 720  # fallback default
-    
+
     def load_video(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Video File", "", "Video Files (*.mp4 *.mkv *.avi *.mov)"
@@ -762,7 +848,8 @@ class MainWindow(QMainWindow):
             self.controls.set_info_text("No audio tracks found in the selected file.")
             return
 
-        extract = self.audio.extract_audio_tracks(file_path, max_tracks=2)
+        # Extract ALL audio tracks (no hard cap)
+        extract = self.audio.extract_audio_tracks(file_path)
         if len(extract) < 1:
             self.controls.set_info_text("No audio tracks found in the selected file.")
             return
@@ -784,8 +871,8 @@ class MainWindow(QMainWindow):
         max_height = int(screen_height * MARGIN_FACTOR)
 
         # Calculate scaling factor if video is larger than screen
-        scale_w = max_width / total_width
-        scale_h = max_height / total_height
+        scale_w = max_width / total_width if total_width > 0 else 1.0
+        scale_h = max_height / total_height if total_height > 0 else 1.0
         scale = min(scale_w, scale_h, 1.0)  # Don't upscale; only downscale
 
         new_width = int(total_width * scale)
@@ -848,9 +935,9 @@ class MainWindow(QMainWindow):
 
     # ----- Scrubbing ----- #
     def update_dur(self, dur):
-            self.controls.set_timeline_range(dur)
-            self.controls.set_timeline_label(f"00:00 / {self.update_label(dur)}")
-            
+        self.controls.set_timeline_range(dur)
+        self.controls.set_timeline_label(f"00:00 / {self.update_label(dur)}")
+
     def update_timeline(self):
         if self.is_scrubbing:
             return
@@ -860,12 +947,12 @@ class MainWindow(QMainWindow):
         self.controls.set_timeline_value_blocked(pos)
         self.controls.set_timeline_label(f"{self.update_label(pos)} / {self.update_label(dur)}")
 
-    def update_label(self, ms): 
-        seconds = ms // 1000 
-        minutes = seconds // 60 
-        seconds %= 60 
+    def update_label(self, ms):
+        seconds = ms // 1000
+        minutes = seconds // 60
+        seconds %= 60
         return f"{minutes:02d}:{seconds:02d}"
-        
+
     def preview_seek_pos(self, pos):
         dur = self.video.dur()
         self.controls.set_timeline_label(f"{self.update_label(pos)} / {self.update_label(dur)}")
@@ -920,9 +1007,9 @@ class MainWindow(QMainWindow):
         # Determines if the position is near an edge.
         x, y = pos.x(), pos.y()
         w, h = self.width(), self.height()
-        
+
         if self.isMaximized():
-            return 0 
+            return 0
 
         on_left = x < BORDER_SIZE
         on_right = x > w - BORDER_SIZE
@@ -948,36 +1035,31 @@ class MainWindow(QMainWindow):
         else:
             return 0
 
-    def mousePressEvent(self, event): 
+    def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             edge = self.get_resize_edge(event.pos())
-            if edge != 0: 
+            if edge != 0:
                 self.dragPos = QPoint()
-                # Starts the system resize handler 
-                self.windowHandle().startSystemResize(edge) 
+                # Starts the system resize handler
+                self.windowHandle().startSystemResize(edge)
                 return
 
             title_bar_rect = self.title_bar.geometry()
             if title_bar_rect.contains(event.pos()):
-                self.dragPos = event.globalPosition().toPoint() 
+                self.dragPos = event.globalPosition().toPoint()
             else:
                 self.dragPos = QPoint()
 
-            
-    def mouseMoveEvent(self, event): 
-        # Handles drag and resize cursor setting. The call to reset_hide_timer()
-        # at the start is the key: it sets the default cursor (ArrowCursor) every time
-        # the mouse moves, preventing
-        #  stuck cursors, unless a boundary is immediately detected.
+    def mouseMoveEvent(self, event):
         self.reset_hide_timer()
 
-        # 2. Dragging Check
-        if event.buttons() == Qt.MouseButton.LeftButton and self.dragPos != QPoint(): 
-            self.move(self.pos() + event.globalPosition().toPoint() - self.dragPos) 
-            self.dragPos = event.globalPosition().toPoint() 
+        # Dragging Check
+        if event.buttons() == Qt.MouseButton.LeftButton and self.dragPos != QPoint():
+            self.move(self.pos() + event.globalPosition().toPoint() - self.dragPos)
+            self.dragPos = event.globalPosition().toPoint()
             return
 
-        # 3. Resizing Cursor Check
+        # Resizing Cursor Check
         if not (event.buttons() & Qt.MouseButton.LeftButton) and not self.isMaximized():
             edge = self.get_resize_edge(event.pos())
 
@@ -995,7 +1077,7 @@ class MainWindow(QMainWindow):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragPos = QPoint()
-            
+
             # Ensure the cursor is restored to Arrow on release if controls are visible or we are paused/stopped.
             if self.controls_visible or not self.is_playing:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1013,13 +1095,20 @@ class MainWindow(QMainWindow):
 
     # ----- Cleanup ----- #
     def closeEvent(self, event):
-        self.stop()
+        self.timer.stop()
+        self.hide_timer.stop()
+
+        self.video.stop()
+        self.video.media_player.setVideoOutput(None)
+        self.video.media_player.deleteLater()
+
         self.audio.cleanup_on_close()
+
         event.accept()
 
 # ------------------------------------- __main__ ------------------------------------- #
-if __name__ == "__main__": 
-    app = QApplication(sys.argv) 
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
     theme = load_theme()
 
     if theme == "dark":
@@ -1033,5 +1122,5 @@ if __name__ == "__main__":
         path = sys.argv[1]
         player.load_video_from_path(path)
 
-    player.show() 
+    player.show()
     sys.exit(app.exec())

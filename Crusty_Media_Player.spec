@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[('ffmpeg\\ffmpeg.exe', '.'), ('ffmpeg\\ffprobe.exe', '.')],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['ffmpeg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -32,6 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='version.txt',
     icon=['icon\\Crusty_Icon.ico'],
 )
 coll = COLLECT(
