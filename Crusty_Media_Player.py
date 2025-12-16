@@ -12,7 +12,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSlider, QWidget, QPushButton, QVBoxLayout,
-    QHBoxLayout, QFileDialog, QLabel, QSizePolicy, QMenu, QToolButton, QScrollArea
+    QHBoxLayout, QFileDialog, QLabel, QSizePolicy, QMenu, QToolButton, QScrollArea, QStyle
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -336,8 +336,9 @@ class AudioManager(QObject):
                      cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
+                self.ffmpeg_subprocesses.append(proc)
                 proc.wait()
                 self.temp_files.append(temp_file.name)
             except Exception:
@@ -406,12 +407,11 @@ class AudioManager(QObject):
                 pass
 
     def cleanup_on_close(self):
-        for p in getattr(self, "ffmpeg_processes", []):
+        for p in self.ffmpeg_subprocesses:
             try:
                 p.terminate()
             except Exception:
                 pass
-        self.ffmpeg_processes = []
 
         for p in self.audio_players:
             try:
@@ -429,8 +429,22 @@ class AudioManager(QObject):
 
         self.audio_players = []
         self.audio_outputs = []
+        self.ffmpeg_subprocesses = []
 
 # ------------------------------ Control Panel (dynamic track controls) ------------------------------ #
+class ClickableSlider(QSlider):
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            value = QStyle.sliderValueFromPosition(
+                self.minimum(),
+                self.maximum(),
+                int(event.position().x()),
+                self.width()
+            )
+            self.setValue(value)
+            self.sliderMoved.emit(value)
+        super().mousePressEvent(event)
+
 class ControlPanel(QWidget):
     open_request = pyqtSignal()
     play_request = pyqtSignal()
@@ -453,7 +467,7 @@ class ControlPanel(QWidget):
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         # Timeline slider
-        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.timeline_slider.setRange(0, 0)
         self.timeline_label = QLabel("00:00 / 00:00")
 
@@ -525,7 +539,7 @@ class ControlPanel(QWidget):
             row_layout.setContentsMargins(0, 0, 0, 0)
 
             label = QLabel(f"Track {i+1} Volume:")
-            slider = QSlider(Qt.Orientation.Horizontal)
+            slider = ClickableSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, 100)
             slider.setValue(25)  # match your existing default
             vol_label = QLabel("100%")
@@ -602,7 +616,7 @@ class MainWindow(QMainWindow):
         self.title_bar = QWidget()
         self.title_bar.setMinimumHeight(0)
         self.title_bar.setMaximumHeight(30)
-        self.title_label = QLabel("Crusty Media Player v1.2.0")
+        self.title_label = QLabel("Crusty Media Player v1.2.1")
         self.title_label.setObjectName("titlelabel")
 
         self.settings_button = QToolButton()
@@ -690,6 +704,7 @@ class MainWindow(QMainWindow):
         self.setFocus()
         self.setMouseTracking(True)
         self.video.video_widget.setMouseTracking(True)
+        self.video.video_widget.installEventFilter(self)
         self.controls.setMouseTracking(True)
         self.title_bar.setMouseTracking(True)
         QApplication.instance().installEventFilter(self)
@@ -727,6 +742,15 @@ class MainWindow(QMainWindow):
 
     # ----- Event filter / UI hide logic ----- #
     def eventFilter(self, obj, event):
+        if obj == self.video.video_widget and event.type() == QEvent.Type.MouseButtonDblClick:
+            self.toggle_maximize()
+            return True
+
+        if obj == self.video.video_widget and event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.toggle_play_pause()
+                return True
+
         if event.type() == QEvent.Type.MouseMove:
             self.reset_hide_timer()
             return False
@@ -783,10 +807,6 @@ class MainWindow(QMainWindow):
 
     # ----- Volume UI handlers ----- #
     def set_track_vol(self, index: int, value: int):
-        """
-        Unified handler for any track volume slider.
-        `value` is 0..100 slider; we convert to gain 0..1 for QAudioOutput.setVolume.
-        """
         gain = value / 100.0
         display_percentage = value * 4
         # Set audio manager volume for the given index
@@ -1123,4 +1143,7 @@ if __name__ == "__main__":
         player.load_video_from_path(path)
 
     player.show()
+    player.activateWindow()
+    player.raise_()
+    player.setFocus()
     sys.exit(app.exec())
