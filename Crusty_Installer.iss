@@ -1,7 +1,7 @@
 ; Script for Crusty Media Player - OneDir PyInstaller Build
 
 #define MyAppName "Crusty Media Player"
-#define MyAppVersion "1.2.1"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "Crusty Monk"
 #define MyAppExeName "Crusty_Media_Player.exe"
 
@@ -30,7 +30,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Main app and dependencies
-Source: "C:\Users\alexc\source\repos\Crusty Media Player\Crusty Media Player\dist\Crusty_Media_Player v1.2.1\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
+Source: "C:\Users\alexc\source\repos\Crusty Media Player\Crusty Media Player\dist\Crusty_Media_Player v1.3.0\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 Source: "C:\Users\alexc\source\repos\Crusty Media Player\Crusty Media Player\icon\Crusty_Icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "C:\Users\alexc\source\repos\Crusty Media Player\Crusty Media Player\settings.json"; DestDir: "{app}"; Flags: ignoreversion
 

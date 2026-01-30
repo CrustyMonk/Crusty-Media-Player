@@ -29,21 +29,42 @@ def get_settings():
 
 SETTINGS_FILE = get_settings()
 
-def load_theme():
+def load_settings():
+    """Load all settings from file"""
+    default_settings = {
+        "theme": "dark",
+        "slider_orientation": "horizontal",
+        "remember_volumes": False,
+        "saved_volumes": {},
+        "hide_controls_on_start": False,
+        "fullscreen_on_start": False
+    }
+    
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r") as f:
-                return json.load(f).get("theme", "dark")
+                loaded = json.load(f)
+                default_settings.update(loaded)
+                return default_settings
         except Exception:
             pass
-    return "dark"
+    return default_settings
 
-def save_theme(theme):
+def save_settings(settings):
+    """Save all settings to file"""
     try:
         with open(SETTINGS_FILE, "w") as f:
-            json.dump({"theme": theme}, f)
+            json.dump(settings, f, indent=2)
     except Exception:
         pass
+
+def load_theme():
+    return load_settings().get("theme", "dark")
+
+def save_theme(theme):
+    settings = load_settings()
+    settings["theme"] = theme
+    save_settings(settings)
 
 DARK_THEME = """
 QMainWindow {
@@ -76,6 +97,17 @@ QSlider::handle:horizontal {
 }
 QSlider::sub-page:horizontal { background: #00ADB5; border-radius: 3px; }
 QSlider::add-page:horizontal { background: #2A2A2A; border-radius: 3px; }
+
+/* Vertical Slider Styles */
+QSlider::groove:vertical {
+    background: #2A2A2A; width: 6px; border-radius: 3px;
+}
+QSlider::handle:vertical {
+    background: #00ADB5; width: 14px; height: 14px; margin: 0 -5px; border-radius: 7px;
+}
+/* For vertical sliders, sub-page and add-page are swapped */
+QSlider::sub-page:vertical { background: #2A2A2A; border-radius: 3px; }
+QSlider::add-page:vertical { background: #00ADB5; border-radius: 3px; }
 
 QWidget#title_bar {
     background-color: #1C1C1C;
@@ -143,6 +175,17 @@ QSlider::handle:horizontal {
 }
 QSlider::sub-page:horizontal { background: #0078D7; border-radius: 3px; }
 QSlider::add-page:horizontal { background: #CCC; border-radius: 3px; }
+
+/* Vertical Slider Styles */
+QSlider::groove:vertical {
+    background: #CCC; width: 6px; border-radius: 3px;
+}
+QSlider::handle:vertical {
+    background: #0078D7; width: 14px; height: 14px; margin: 0 -5px; border-radius: 7px;
+}
+/* For vertical sliders, sub-page and add-page are swapped */
+QSlider::sub-page:vertical { background: #CCC; border-radius: 3px; }
+QSlider::add-page:vertical { background: #0078D7; border-radius: 3px; }
 
 QWidget#title_bar {
     background-color: #EAEAEA;
@@ -435,12 +478,21 @@ class AudioManager(QObject):
 class ClickableSlider(QSlider):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            value = QStyle.sliderValueFromPosition(
-                self.minimum(),
-                self.maximum(),
-                int(event.position().x()),
-                self.width()
-            )
+            if self.orientation() == Qt.Orientation.Horizontal:
+                value = QStyle.sliderValueFromPosition(
+                    self.minimum(),
+                    self.maximum(),
+                    int(event.position().x()),
+                    self.width()
+                )
+            else:  # Vertical
+                # Invert for vertical sliders (top = max, bottom = min)
+                value = QStyle.sliderValueFromPosition(
+                    self.minimum(),
+                    self.maximum(),
+                    self.height() - int(event.position().y()),
+                    self.height()
+                )
             self.setValue(value)
             self.sliderMoved.emit(value)
         super().mousePressEvent(event)
@@ -477,6 +529,12 @@ class ControlPanel(QWidget):
         # The dynamic track controls area (scrollable if many tracks)
         self.track_controls_area = QScrollArea()
         self.track_controls_area.setWidgetResizable(True)
+        # Set default size policy to prevent expanding into buttons
+        self.track_controls_area.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed
+        )
+        self.track_controls_area.setMaximumHeight(200)  # Default max height
         self.track_container = QWidget()
         self.track_controls_layout = QVBoxLayout(self.track_container)
         self.track_controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -504,8 +562,8 @@ class ControlPanel(QWidget):
         main_layout.setSpacing(5)
         main_layout.addLayout(timeline_layout)
         main_layout.addWidget(self.info_label)
-        main_layout.addLayout(volume_container_layout)
-        main_layout.addLayout(controls_layout)
+        main_layout.addLayout(volume_container_layout, stretch=1)  # Volume slider tile
+        main_layout.addLayout(controls_layout, stretch=0)  # Button tile (directly below)
 
         # Connections
         self.open_button.clicked.connect(lambda: self.open_request.emit())
@@ -529,34 +587,93 @@ class ControlPanel(QWidget):
                     w.setParent(None)
         self._track_widgets = []
 
-    def populate_track_controls(self, num_tracks: int):
-        
-        # Create N sliders/labels for audio tracks. Existing controls are cleared.
+    def populate_track_controls(self, num_tracks: int, orientation="horizontal"):
+        # Create N sliders/labels for audio tracks with specified orientation
         self.clear_track_controls()
-        for i in range(num_tracks):
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-
-            label = QLabel(f"Track {i+1} Volume:")
-            slider = ClickableSlider(Qt.Orientation.Horizontal)
-            slider.setRange(0, 100)
-            slider.setValue(25)  # match your existing default
-            vol_label = QLabel("100%")
-
-            slider.valueChanged.connect(partial(self._on_track_slider_changed, i))
-            # Keep a reference for later updates
-            row_layout.addWidget(label)
-            row_layout.addWidget(slider)
-            row_layout.addWidget(vol_label)
-
-            self.track_controls_layout.addWidget(row)
-            self._track_widgets.append((label, slider, vol_label))
-
-        # If no tracks, show a small hint
+        
+        # Adjust scroll area behavior and sizing based on orientation
+        if orientation == "vertical":
+            # Vertical sliders don't need scrolling - they fill the space
+            self.track_controls_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.track_controls_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # Let the content size itself naturally - no constraints
+            self.track_controls_area.setMinimumHeight(150)
+            self.track_controls_area.setMaximumHeight(240)
+            self.track_controls_area.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Minimum  # Take only what content needs
+            )
+        else:
+            # Horizontal sliders might need scrolling if many tracks
+            self.track_controls_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.track_controls_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # Limit height for horizontal sliders
+            self.track_controls_area.setMinimumHeight(0)
+            self.track_controls_area.setMaximumHeight(200)
+            self.track_controls_area.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Preferred
+            )
+        
+        if orientation == "vertical":
+            # For vertical sliders, arrange them horizontally (left to right)
+            sliders_container = QWidget()
+            sliders_layout = QHBoxLayout(sliders_container)
+            sliders_layout.setContentsMargins(5, 5, 5, 5)
+            sliders_layout.setSpacing(15)
+            sliders_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            
+            for i in range(num_tracks):
+                slider_widget = QWidget()
+                slider_layout = QVBoxLayout(slider_widget)
+                slider_layout.setContentsMargins(0, 0, 0, 0)
+                slider_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                slider_layout.setSpacing(5)
+                
+                label = QLabel(f"Track {i+1}")
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                
+                slider = ClickableSlider(Qt.Orientation.Vertical)
+                slider.setRange(0, 100)
+                slider.setValue(25)
+                slider.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+                slider.setMinimumHeight(100)
+                slider.setMaximumHeight(200)
+                
+                vol_label = QLabel("100%")
+                vol_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                
+                slider_layout.addWidget(label)
+                slider_layout.addWidget(slider, 1)
+                slider_layout.addWidget(vol_label)
+                
+                slider.valueChanged.connect(partial(self._on_track_slider_changed, i))
+                sliders_layout.addWidget(slider_widget)
+                self._track_widgets.append((label, slider, vol_label))
+            
+            self.track_controls_layout.addWidget(sliders_container)
+        else:
+            # Horizontal sliders (original)
+            for i in range(num_tracks):
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                label = QLabel(f"Track {i+1} Volume:")
+                slider = ClickableSlider(Qt.Orientation.Horizontal)
+                slider.setRange(0, 100)
+                slider.setValue(25)
+                vol_label = QLabel("100%")
+                slider.valueChanged.connect(partial(self._on_track_slider_changed, i))
+                row_layout.addWidget(label)
+                row_layout.addWidget(slider)
+                row_layout.addWidget(vol_label)
+                self.track_controls_layout.addWidget(row)
+                self._track_widgets.append((label, slider, vol_label))
+        
         if num_tracks == 0:
             hint = QLabel("No audio tracks.")
             self.track_controls_layout.addWidget(hint)
+
 
     def _on_track_slider_changed(self, index: int, value: int):
         # Mirror old display semantics: slider value * 4 = displayed percentage
@@ -598,6 +715,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
+        self.settings = load_settings()
+
         # ----- Window Setup ----- #
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -606,6 +725,8 @@ class MainWindow(QMainWindow):
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
+
+        self.setAcceptDrops(True)
 
         # Core components
         self.video = VideoPlayer(self)
@@ -616,7 +737,7 @@ class MainWindow(QMainWindow):
         self.title_bar = QWidget()
         self.title_bar.setMinimumHeight(0)
         self.title_bar.setMaximumHeight(30)
-        self.title_label = QLabel("Crusty Media Player v1.2.1")
+        self.title_label = QLabel("Crusty Media Player v1.3.0")
         self.title_label.setObjectName("titlelabel")
 
         self.settings_button = QToolButton()
@@ -627,8 +748,70 @@ class MainWindow(QMainWindow):
         self.settings_button.setArrowType(Qt.ArrowType.NoArrow)
 
         self.settings_menu = QMenu()
-        self.settings_menu.addAction("Light Mode", lambda: self.apply_theme("light"))
-        self.settings_menu.addAction("Dark Mode", lambda: self.apply_theme("dark"))
+
+        # File submenu
+        file_menu = QMenu("File", self)
+        self.export_action = file_menu.addAction("Export Video with Audio Mix...", self.export_video)
+        self.settings_menu.addMenu(file_menu)
+
+        # Appearance submenu
+        appearance_menu = QMenu("Appearance", self)
+        self.light_mode_action = appearance_menu.addAction("Light Mode", lambda: self.apply_theme("light"))
+        self.light_mode_action.setCheckable(True)
+        self.light_mode_action.setChecked(self.settings.get("theme") == "light")
+
+        self.dark_mode_action = appearance_menu.addAction("Dark Mode", lambda: self.apply_theme("dark"))
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setChecked(self.settings.get("theme") == "dark")
+
+        self.settings_menu.addMenu(appearance_menu)
+
+        # Control Panel submenu
+        control_panel_menu = QMenu("Control Panel", self)
+
+        # Slider orientation
+        self.horizontal_slider_action = control_panel_menu.addAction(
+            "● Horizontal Sliders" if self.settings.get("slider_orientation") == "horizontal" else "○ Horizontal Sliders",
+            lambda: self.set_slider_orientation("horizontal")
+        )
+        self.horizontal_slider_action.setCheckable(True)
+        self.horizontal_slider_action.setChecked(self.settings.get("slider_orientation") == "horizontal")
+
+        self.vertical_slider_action = control_panel_menu.addAction(
+            "● Vertical Sliders" if self.settings.get("slider_orientation") == "vertical" else "○ Vertical Sliders",
+            lambda: self.set_slider_orientation("vertical")
+        )
+        self.vertical_slider_action.setCheckable(True)
+        self.vertical_slider_action.setChecked(self.settings.get("slider_orientation") == "vertical")
+
+        control_panel_menu.addSeparator()
+
+        # Remember volumes
+        self.remember_volumes_action = control_panel_menu.addAction(
+            "✓ Remember Volume Levels" if self.settings.get("remember_volumes") else "x Remember Volume Levels",
+            self.toggle_remember_volumes
+        )
+        self.remember_volumes_action.setCheckable(True)
+        self.remember_volumes_action.setChecked(self.settings.get("remember_volumes", False))
+
+        control_panel_menu.addSeparator()
+
+        # Startup behavior
+        self.hide_controls_action = control_panel_menu.addAction(
+            "✓ Hide Controls on Start" if self.settings.get("hide_controls_on_start") else "x Hide Controls on Start",
+            self.toggle_hide_controls_on_start
+        )
+        self.hide_controls_action.setCheckable(True)
+        self.hide_controls_action.setChecked(self.settings.get("hide_controls_on_start", False))
+
+        self.fullscreen_start_action = control_panel_menu.addAction(
+            "✓ Fullscreen on Start" if self.settings.get("fullscreen_on_start") else "x Fullscreen on Start",
+            self.toggle_fullscreen_on_start
+        )
+        self.fullscreen_start_action.setCheckable(True)
+        self.fullscreen_start_action.setChecked(self.settings.get("fullscreen_on_start", False))
+
+        self.settings_menu.addMenu(control_panel_menu)
         self.settings_button.setMenu(self.settings_menu)
 
         self.close_button = QPushButton("✕")
@@ -677,6 +860,7 @@ class MainWindow(QMainWindow):
         self.is_playing = False
         self.is_scrubbing = False
         self.controls_visible = True
+        self.current_video_path = None  # Store the currently loaded video path
 
         # ----- Animations ----- #
         QApplication.processEvents()
@@ -719,6 +903,13 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_timeline)
 
         self.was_playing = False
+
+        # Apply startup preferences
+        if self.settings.get("hide_controls_on_start", False):
+            QTimer.singleShot(100, self.hide_controls)
+
+        if self.settings.get("fullscreen_on_start", False):
+            QTimer.singleShot(100, self.toggle_maximize)
 
         # ----- Connections to control panel ----- #
         self.controls.open_request.connect(self.load_video)
@@ -814,9 +1005,37 @@ class MainWindow(QMainWindow):
         # Update the UI label for that track
         self.controls.set_track_vol_label(index, f"{display_percentage}%")
 
+        # Save volume if remember setting is enabled
+        if self.settings.get("remember_volumes", False):
+            self.settings["saved_volumes"][f"track_{index}"] = value
+            save_settings(self.settings)
+
+    def apply_saved_volumes(self, saved_volumes):
+        """Apply saved volumes to audio players and UI sliders"""
+        for i in range(len(self.audio.audio_players)):
+            track_key = f"track_{i}"
+            if track_key in saved_volumes:
+                volume = saved_volumes[track_key]
+            
+                # Apply to audio output
+                gain = volume / 100.0
+                self.audio.audio_outputs[i].setVolume(gain)
+            
+                # Update UI slider
+                if i < len(self.controls._track_widgets):
+                    _, slider, vol_label = self.controls._track_widgets[i]
+                    slider.blockSignals(True)
+                    slider.setValue(volume)
+                    slider.blockSignals(False)
+                
+                    # Update label
+                    display_percentage = volume * 4
+                    vol_label.setText(f"{display_percentage}%")
+
     def update_vol_ui(self, num_audio_tracks):
         # create dynamic controls for N tracks
-        self.controls.populate_track_controls(num_audio_tracks)
+        orientation = self.settings.get("slider_orientation", "horizontal")
+        self.controls.populate_track_controls(num_audio_tracks, orientation)
         # adjust info text label naming for single track
         if num_audio_tracks == 1:
             try:
@@ -824,6 +1043,8 @@ class MainWindow(QMainWindow):
                 label_widget.setText("Volume:")
             except Exception:
                 pass
+        
+        self.refresh_controls_target_height()
 
     # ----- Loading media and control ----- #
     def get_video_resolution(self, file_path):
@@ -853,6 +1074,7 @@ class MainWindow(QMainWindow):
         self.load_video_common(file_path)
 
     def load_video_common(self, file_path):
+        self.current_video_path = file_path  # Store the current video path
         self.controls.set_info_text(f"Loading audio tracks from:\n{os.path.basename(file_path)}")
 
         self.audio.cleanup_temp_files()
@@ -878,6 +1100,11 @@ class MainWindow(QMainWindow):
         self.video.set_video_muted()
 
         self.audio.set_audio_src()
+
+        # Load saved volumes if setting is enabled
+        if self.settings.get("remember_volumes", False):
+            saved_volumes = self.settings.get("saved_volumes", {})
+            QTimer.singleShot(250, lambda: self.apply_saved_volumes(saved_volumes))
 
         screen_geom = QApplication.primaryScreen().availableGeometry()
         screen_width, screen_height = screen_geom.width(), screen_geom.height()
@@ -972,6 +1199,21 @@ class MainWindow(QMainWindow):
         minutes = seconds // 60
         seconds %= 60
         return f"{minutes:02d}:{seconds:02d}"
+
+    def refresh_controls_target_height(self):
+        # Recalculate required height now that the contents changed
+        QApplication.processEvents()
+        new_target = max(self.controls.sizeHint().height(), 200)
+
+        self.target_height = new_target
+
+        # If controls are currently visible, apply immediately
+        if self.controls_visible:
+            self.controls.setMaximumHeight(new_target)
+
+        # Update the animation end value so show_controls() opens to the right size
+        self.animation.stop()
+        self.animation.setEndValue(new_target)
 
     def preview_seek_pos(self, pos):
         dur = self.video.dur()
@@ -1071,6 +1313,21 @@ class MainWindow(QMainWindow):
                 self.dragPos = QPoint()
 
     def mouseMoveEvent(self, event):
+        # Check for snap to fullscreen (drag to top of screen)
+        if event.buttons() == Qt.MouseButton.LeftButton and self.dragPos != QPoint():
+            new_pos = self.pos() + event.globalPosition().toPoint() - self.dragPos
+    
+            # Check if window is being dragged to top of screen
+            if new_pos.y() <= 0 and not self.isFullScreen():
+                self.showFullScreen()
+                self.maximize_button.setText("v")
+                self.dragPos = QPoint()
+                return
+    
+            self.move(new_pos)
+            self.dragPos = event.globalPosition().toPoint()
+            return
+
         self.reset_hide_timer()
 
         # Dragging Check
@@ -1113,6 +1370,192 @@ class MainWindow(QMainWindow):
             QApplication.instance().setStyleSheet(LIGHT_THEME)
         save_theme(theme)
 
+    def set_slider_orientation(self, orientation):
+        """Change slider orientation between horizontal and vertical"""
+        self.settings["slider_orientation"] = orientation
+        save_settings(self.settings)
+    
+        self.horizontal_slider_action.setChecked(orientation == "horizontal")
+        self.horizontal_slider_action.setText(
+        "● Horizontal Sliders" if orientation == "horizontal" else "○ Horizontal Sliders"
+        )
+    
+        self.vertical_slider_action.setChecked(orientation == "vertical")
+        self.vertical_slider_action.setText(
+        "● Vertical Sliders" if orientation == "vertical" else "○ Vertical Sliders"
+        )
+    
+        num_tracks = len(self.audio.audio_players)
+        if num_tracks > 0:
+            self.rebuild_volume_controls(num_tracks)
+
+    def toggle_remember_volumes(self):
+        """Toggle the remember volumes setting"""
+        current = self.settings.get("remember_volumes", False)
+        new_value = not current
+        self.settings["remember_volumes"] = new_value
+        save_settings(self.settings)
+        self.remember_volumes_action.setChecked(new_value)
+        self.remember_volumes_action.setText(
+            "✓ Remember Volume Levels" if new_value else "x Remember Volume Levels"
+        )
+
+    def toggle_hide_controls_on_start(self):
+        """Toggle hide controls on start setting"""
+        current = self.settings.get("hide_controls_on_start", False)
+        new_value = not current
+        self.settings["hide_controls_on_start"] = new_value
+        save_settings(self.settings)
+        self.hide_controls_action.setChecked(new_value)
+        self.hide_controls_action.setText(
+            "✓ Hide Controls on Start" if new_value else "x Hide Controls on Start"
+        )
+
+    def toggle_fullscreen_on_start(self):
+        """Toggle fullscreen on start setting"""
+        current = self.settings.get("fullscreen_on_start", False)
+        new_value = not current
+        self.settings["fullscreen_on_start"] = new_value
+        save_settings(self.settings)
+        self.fullscreen_start_action.setChecked(new_value)
+        self.fullscreen_start_action.setText(
+            "✓ Fullscreen on Start" if new_value else "x Fullscreen on Start"
+        )
+
+    def export_video(self):
+        """Export video with mixed audio tracks using ffmpeg"""
+        # Check if a video is loaded
+        if not self.current_video_path or not os.path.exists(self.current_video_path):
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "No Video Loaded", "Please load a video file before exporting.")
+            return
+        
+        # Check if there are audio tracks
+        num_tracks = len(self.audio.audio_players)
+        if num_tracks == 0:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "No Audio Tracks", "The current video has no audio tracks to mix.")
+            return
+        
+        # Get output file path from user
+        default_name = os.path.splitext(os.path.basename(self.current_video_path))[0] + "_mixed.mp4"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Export Video As", 
+            default_name,
+            "MP4 Files (*.mp4);;MKV Files (*.mkv);;All Files (*.*)"
+        )
+        
+        if not output_path:
+            return  # User cancelled
+        
+        # Pause playback during export
+        was_playing = self.is_playing
+        if was_playing:
+            self.pause()
+        
+        # Show progress message
+        self.controls.set_info_text("Exporting video... This may take a while.")
+        QApplication.processEvents()
+        
+        try:
+            # Build ffmpeg command
+            # Start with input video
+            cmd = ["ffmpeg", "-i", self.current_video_path]
+            
+            # Add all audio track files as inputs
+            for temp_file in self.audio.temp_files:
+                cmd.extend(["-i", temp_file])
+            
+            # Build filter_complex for audio mixing with volume adjustments
+            filter_parts = []
+            for i in range(num_tracks):
+                # Get the current volume from the slider (0-100, where 25 = 100%)
+                try:
+                    _, slider, _ = self.controls._track_widgets[i]
+                    slider_value = slider.value()
+                    # Convert slider value to volume multiplier (slider 25 = 1.0x, 100 = 4.0x)
+                    volume = slider_value / 25.0
+                except Exception:
+                    volume = 1.0  # Default to normal volume if error
+                
+                # Audio input index is i+1 (video is 0, first audio is 1, etc.)
+                filter_parts.append(f"[{i+1}:a]volume={volume}[a{i}]")
+            
+            # Mix all adjusted audio streams
+            mix_inputs = "".join([f"[a{i}]" for i in range(num_tracks)])
+            filter_parts.append(f"{mix_inputs}amix=inputs={num_tracks}:duration=longest[aout]")
+            
+            filter_complex = ";".join(filter_parts)
+            
+            # Add filter_complex to command
+            cmd.extend(["-filter_complex", filter_complex])
+            
+            # Map video from first input and mixed audio
+            cmd.extend([
+                "-map", "0:v",      # Video from first input
+                "-map", "[aout]",   # Mixed audio output
+                "-c:v", "copy",     # Copy video codec (no re-encoding)
+                "-c:a", "aac",      # Encode audio as AAC
+                "-b:a", "320k",     # High quality audio bitrate
+                "-y",               # Overwrite output file if exists
+                output_path
+            ])
+            
+            # Run ffmpeg
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self, 
+                    "Export Complete", 
+                    f"Video exported successfully to:\n{output_path}"
+                )
+                self.controls.set_info_text(f"Export complete! Saved to:\n{os.path.basename(output_path)}")
+            else:
+                from PyQt6.QtWidgets import QMessageBox
+                error_msg = result.stderr[-500:] if result.stderr else "Unknown error"
+                QMessageBox.critical(
+                    self, 
+                    "Export Failed", 
+                    f"FFmpeg export failed:\n{error_msg}"
+                )
+                self.controls.set_info_text("Export failed. Check console for details.")
+                print("FFmpeg error:", result.stderr)
+        
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Export Error", f"An error occurred during export:\n{str(e)}")
+            self.controls.set_info_text(f"Export error: {str(e)}")
+            print("Export exception:", e)
+        
+        finally:
+            # Resume playback if it was playing before
+            if was_playing:
+                self.play()
+
+    def rebuild_volume_controls(self, num_tracks):
+        """Rebuild volume controls with current orientation"""
+        current_volumes = []
+        for _, slider, _ in self.controls._track_widgets:
+            current_volumes.append(slider.value())
+    
+        orientation = self.settings.get("slider_orientation", "horizontal")
+        self.controls.populate_track_controls(num_tracks, orientation)
+    
+        for i, volume in enumerate(current_volumes):
+            if i < len(self.controls._track_widgets):
+                _, slider, _ = self.controls._track_widgets[i]
+                slider.setValue(volume)
+        
+        self.refresh_controls_target_height()
+
     # ----- Cleanup ----- #
     def closeEvent(self, event):
         self.timer.stop()
@@ -1125,6 +1568,20 @@ class MainWindow(QMainWindow):
         self.audio.cleanup_on_close()
 
         event.accept()
+
+    def dragEnterEvent(self, event):
+        """Accept drag events with video files"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """Handle dropped files"""
+        urls = event.mimeData().urls()
+        if urls:
+            file_path = urls[0].toLocalFile()
+            video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.ogg', '.mpeg']
+            if any(file_path.lower().endswith(ext) for ext in video_extensions):
+                self.load_video_from_path(file_path)
 
 # ------------------------------------- __main__ ------------------------------------- #
 if __name__ == "__main__":
