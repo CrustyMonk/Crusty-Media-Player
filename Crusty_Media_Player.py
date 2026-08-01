@@ -8,15 +8,15 @@ from pathlib import Path
 from functools import partial
 
 from PyQt6.QtCore import (
-    Qt, QUrl, QTimer, QPoint, QPropertyAnimation, QEvent, QEasingCurve, pyqtSignal, QObject, QRectF
+    Qt, QUrl, QTimer, QPoint, QPropertyAnimation, QEvent, QEasingCurve, pyqtSignal, QObject, QRectF, QThread
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSlider, QWidget, QPushButton, QVBoxLayout,
-    QHBoxLayout, QFileDialog, QLabel, QSizePolicy, QMenu, QToolButton, QScrollArea, QStyle
+    QHBoxLayout, QFileDialog, QLabel, QSizePolicy, QMenu, QToolButton, QScrollArea, QStyle, QCheckBox
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtGui import QShortcut, QCursor, QPainter
+from PyQt6.QtGui import QShortcut, QCursor, QPainter, QAction, QActionGroup, QActionGroup
 
 # ----------------------------- Settings & Themes ----------------------------- #
 
@@ -36,8 +36,11 @@ def load_settings():
         "slider_orientation": "horizontal",
         "remember_volumes": False,
         "saved_volumes": {},
-        "hide_controls_on_start": False,
-        "fullscreen_on_start": False
+        "fullscreen_on_start": False,
+        "auto_hide_controls": True,
+        "hide_delay": 2000,
+        "recent_files": [],
+        "last_open_dir": ""
     }
     
     if os.path.exists(SETTINGS_FILE):
@@ -223,7 +226,7 @@ QPushButton#closebutton:hover {
 """
 
 # Border detection size
-BORDER_SIZE = 8
+BORDER_SIZE = 10  # Увеличил для лучшей чувствительности
 
 # Force ffmpeg-python to use bundled ffmpeg.exe if present
 if getattr(sys, 'frozen', False):
@@ -245,9 +248,18 @@ class VideoPlayer(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.normal_geometry = None
         self.media_player = QMediaPlayer()
         self.video_widget = QVideoWidget()
+        self.setAcceptDrops(True)
         self.video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        # Включаем аппаратное ускорение
+        self.video_widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, False)
+        # QVideoWidget рендерит видео через нативное окно, которое перехватывает
+        # mouse/drag события ещё до Qt DnD-механизма. Делаем его "прозрачным" для
+        # мыши, чтобы drag&drop события проваливались до VideoPlayer (self),
+        # где dragEnterEvent/dropEvent уже реализованы и рабочие.
+        self.video_widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -259,6 +271,24 @@ class VideoPlayer(QWidget):
         self.media_player.positionChanged.connect(lambda pos: self.position_changed.emit(int(pos)))
         self.media_player.durationChanged.connect(lambda dur: self.duration_changed.emit(int(dur)))
         self.media_player.playbackStateChanged.connect(self.playback_state_changed)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if path:
+                window = self.window()
+                if hasattr(window, "load_video_from_path"):
+                    window.load_video_from_path(path)
+                event.acceptProposedAction()
+                return
+        event.ignore()
 
     def playback_state_changed(self, state):
         is_playing = state == QMediaPlayer.PlaybackState.PlayingState
@@ -324,19 +354,17 @@ class AudioManager(QObject):
         self.audio_players = []
         self.audio_outputs = []
 
-    def detect_audio_tracks(self, file_path: str) -> int:
-        # Use ffprobe to detect number of audio streams
+    def probe_media(self, file_path: str):
+        """Один вызов ffprobe вместо трёх: считает аудиодорожки и сразу берёт
+        разрешение видео. Раньше это были отдельные ffprobe-запуски (детект
+        аудио вызывался дважды, плюс отдельный запрос разрешения на GUI-потоке),
+        что заметно тормозило открытие файла."""
         try:
             cmd = [
                 "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "a",
-                "-show_entries",
-                "stream=index",
-                "-of",
-                "json",
+                "-v", "error",
+                "-show_entries", "stream=index,codec_type,width,height",
+                "-of", "json",
                 file_path,
             ]
             result = subprocess.run(
@@ -346,23 +374,41 @@ class AudioManager(QObject):
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            probe_data = json.loads(result.stdout) if result.stdout else {}
-            streams = probe_data.get("streams", [])
-            num = len(streams)
-            self.audio_tracks_detected.emit(num)
-            return num
+            data = json.loads(result.stdout) if result.stdout else {}
+            streams = data.get("streams", [])
+            audio_count = sum(1 for s in streams if s.get("codec_type") == "audio")
+            video_stream = next(
+                (s for s in streams if s.get("codec_type") == "video" and "width" in s and "height" in s),
+                None
+            )
+            if video_stream:
+                width, height = int(video_stream["width"]), int(video_stream["height"])
+            else:
+                width, height = 1280, 720
+            return audio_count, width, height
         except Exception:
-            return 0
+            return 0, 1280, 720
 
-    def extract_audio_tracks(self, file_path: str, max_tracks: int = None):
+    def detect_audio_tracks(self, file_path: str) -> int:
+        # Тонкая обёртка над probe_media — раньше здесь был отдельный ffprobe-запуск.
+        audio_count, _, _ = self.probe_media(file_path)
+        self.audio_tracks_detected.emit(audio_count)
+        return audio_count
+
+    def extract_audio_tracks(self, file_path: str, num_audio_tracks: int = None, max_tracks: int = None):
         # Extract all audio tracks (or up to max_tracks if provided) to WAV temp files. Returns list of temp file paths.
         self.cleanup_temp_files()
-        num_audio_tracks = self.detect_audio_tracks(file_path)
+        if num_audio_tracks is None:
+            num_audio_tracks = self.detect_audio_tracks(file_path)
         if num_audio_tracks == 0:
             return []
 
         total_to_extract = num_audio_tracks if max_tracks is None else min(num_audio_tracks, max_tracks)
 
+        # Запускаем ffmpeg для всех дорожек параллельно, а не по очереди —
+        # суммарное время ожидания становится равно самой долгой дорожке,
+        # а не сумме всех (важно именно для видео с несколькими дорожками).
+        jobs = []  # (temp_path, process)
         for i in range(total_to_extract):
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
             temp_file.close()
@@ -376,33 +422,39 @@ class AudioManager(QObject):
                     .compile()
                 )
                 proc = subprocess.Popen(
-                     cmd,
+                    cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
                 self.ffmpeg_subprocesses.append(proc)
-                proc.wait()
-                self.temp_files.append(temp_file.name)
+                jobs.append((temp_file.name, proc))
             except Exception:
-                # stop if extraction fails for any stream
+                # stop launching more if one fails to start
                 break
 
-        # create QMediaPlayers and QAudioOutputs dynamically for each extracted file
+        for temp_path, proc in jobs:
+            try:
+                proc.wait()
+                if proc.returncode == 0:
+                    self.temp_files.append(temp_path)
+            except Exception:
+                pass
+
+        return self.temp_files
+
+    def setup_audio_players(self):
+        """Create Qt audio objects in the GUI thread after extraction."""
         self.audio_players = []
         self.audio_outputs = []
-
         for path in self.temp_files:
-            player = QMediaPlayer()
-            audio_out = QAudioOutput()
+            player = QMediaPlayer(self)
+            audio_out = QAudioOutput(self)
             player.setAudioOutput(audio_out)
-            # set an initial comfortable volume (0-1)
             audio_out.setVolume(0.25)
             player.setSource(QUrl.fromLocalFile(path))
             self.audio_players.append(player)
             self.audio_outputs.append(audio_out)
-
-        return self.temp_files
 
     def set_audio_src(self):
         # Already set during extract (setSource). Keep for compatibility if needed.
@@ -476,26 +528,144 @@ class AudioManager(QObject):
 
 # ------------------------------ Control Panel (dynamic track controls) ------------------------------ #
 class ClickableSlider(QSlider):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dragging = False
+
+    def _value_from_pos(self, pos):
+        # Позиция может выходить за границы виджета (мышь зажата и уведена в сторону) —
+        # зажимаем её в пределах виджета, чтобы значение оставалось в [minimum, maximum].
+        if self.orientation() == Qt.Orientation.Horizontal:
+            x = max(0, min(self.width(), int(pos.x())))
+            return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), x, self.width())
+        else:
+            y = max(0, min(self.height(), int(pos.y())))
+            return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), self.height() - y, self.height())
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            if self.orientation() == Qt.Orientation.Horizontal:
-                value = QStyle.sliderValueFromPosition(
-                    self.minimum(),
-                    self.maximum(),
-                    int(event.position().x()),
-                    self.width()
-                )
-            else:  # Vertical
-                # Invert for vertical sliders (top = max, bottom = min)
-                value = QStyle.sliderValueFromPosition(
-                    self.minimum(),
-                    self.maximum(),
-                    self.height() - int(event.position().y()),
-                    self.height()
-                )
+            value = self._value_from_pos(event.position())
+            self.setValue(value)
+
+            # Захватываем мышь: теперь move/release будут приходить в этот
+            # виджет, даже если курсор уйдёт за его пределы (как на YouTube).
+            self._dragging = True
+            self.grabMouse()
+
+            self.sliderPressed.emit()
+            self.sliderMoved.emit(value)
+
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            value = self._value_from_pos(event.position())
             self.setValue(value)
             self.sliderMoved.emit(value)
-        super().mousePressEvent(event)
+            event.accept()
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.releaseMouse()
+            self.sliderReleased.emit()
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
+
+
+# Новый класс для фонового извлечения
+class AudioExtractorThread(QThread):
+    # Сигналы для обновления UI
+    extraction_finished = pyqtSignal(list)  # список путей к временным файлам
+    extraction_progress = pyqtSignal(str)   # сообщение о прогрессе
+    extraction_error = pyqtSignal(str)      # сообщение об ошибке
+    audio_tracks_detected = pyqtSignal(int) # кол-во аудио-треков
+    video_resolution_detected = pyqtSignal(int, int)  # (width, height), из того же ffprobe-вызова
+
+    def __init__(self, file_path, audio_manager, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.audio_manager = audio_manager
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        # Останавливаем ffmpeg процессы, если они запущены
+        for proc in self.audio_manager.ffmpeg_subprocesses:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            # Шаг 1: один ffprobe-вызов — считаем аудиодорожки И разрешение видео разом.
+            num_audio_tracks, width, height = self.audio_manager.probe_media(self.file_path)
+            if self._is_cancelled:
+                return
+            self.audio_tracks_detected.emit(num_audio_tracks)
+            self.video_resolution_detected.emit(width, height)
+
+            if num_audio_tracks == 0:
+                self.extraction_finished.emit([])
+                return
+
+            # Шаг 2: Извлекаем аудио (все дорожки параллельно, число уже известно из Шага 1)
+            self.extraction_progress.emit("Extracting audio tracks...")
+            temp_files = self.audio_manager.extract_audio_tracks(self.file_path, num_audio_tracks)
+            
+            if self._is_cancelled:
+                # Если отменено, чистим за собой
+                self.audio_manager.cleanup_temp_files()
+                return
+
+            if not temp_files:
+                self.extraction_error.emit("Failed to extract audio tracks.")
+                return
+
+            # Шаг 3: Настраиваем плееры для аудио (это быстро, можно оставить в основном потоке)
+            # Но мы передадим список файлов в основной поток через сигнал
+            self.extraction_finished.emit(temp_files)
+
+        except Exception as e:
+            if not self._is_cancelled:
+                self.extraction_error.emit(f"Extraction failed: {str(e)}")
+
+# Фоновый поток экспорта: раньше финальный ffmpeg-рендер запускался через
+# subprocess.run() прямо в GUI-потоке и полностью замораживал окно на всё
+# время экспорта (никакой перерисовки, drag/resize, ничего).
+class ExportThread(QThread):
+    export_finished = pyqtSignal(bool, str)  # (success, output_path_or_error_message)
+
+    def __init__(self, cmd, output_path, parent=None):
+        super().__init__(parent)
+        self.cmd = cmd
+        self.output_path = output_path
+
+    def run(self):
+        try:
+            result = subprocess.run(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            if result.returncode == 0:
+                self.export_finished.emit(True, self.output_path)
+            else:
+                error_msg = result.stderr[-500:] if result.stderr else "Unknown error"
+                self.export_finished.emit(False, error_msg)
+        except Exception as e:
+            self.export_finished.emit(False, str(e))
 
 class ControlPanel(QWidget):
     open_request = pyqtSignal()
@@ -506,6 +676,7 @@ class ControlPanel(QWidget):
     timeline_moved = pyqtSignal(int)
     # unified signal: (track_index, value)
     track_vol_chg = pyqtSignal(int, int)
+    track_mute_chg = pyqtSignal(int, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -576,6 +747,7 @@ class ControlPanel(QWidget):
 
         # internal storage of controls for label updates
         self._track_widgets = []  # list of (label_widget, slider_widget, vol_label_widget)
+        self._track_mutes = []    # list of mute QCheckBox, parallel to _track_widgets
 
     def clear_track_controls(self):
         # Remove existing controls
@@ -586,6 +758,7 @@ class ControlPanel(QWidget):
                 if w:
                     w.setParent(None)
         self._track_widgets = []
+        self._track_mutes = []
 
     def populate_track_controls(self, num_tracks: int, orientation="horizontal"):
         # Create N sliders/labels for audio tracks with specified orientation
@@ -642,14 +815,19 @@ class ControlPanel(QWidget):
                 
                 vol_label = QLabel("100%")
                 vol_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                
+
+                mute_box = QCheckBox("Mute")
+
                 slider_layout.addWidget(label)
                 slider_layout.addWidget(slider, 1)
                 slider_layout.addWidget(vol_label)
-                
+                slider_layout.addWidget(mute_box)
+
                 slider.valueChanged.connect(partial(self._on_track_slider_changed, i))
+                mute_box.toggled.connect(partial(self._on_track_mute_toggled, i))
                 sliders_layout.addWidget(slider_widget)
                 self._track_widgets.append((label, slider, vol_label))
+                self._track_mutes.append(mute_box)
             
             self.track_controls_layout.addWidget(sliders_container)
         else:
@@ -663,12 +841,16 @@ class ControlPanel(QWidget):
                 slider.setRange(0, 100)
                 slider.setValue(25)
                 vol_label = QLabel("100%")
+                mute_box = QCheckBox("Mute")
                 slider.valueChanged.connect(partial(self._on_track_slider_changed, i))
+                mute_box.toggled.connect(partial(self._on_track_mute_toggled, i))
                 row_layout.addWidget(label)
                 row_layout.addWidget(slider)
                 row_layout.addWidget(vol_label)
+                row_layout.addWidget(mute_box)
                 self.track_controls_layout.addWidget(row)
                 self._track_widgets.append((label, slider, vol_label))
+                self._track_mutes.append(mute_box)
         
         if num_tracks == 0:
             hint = QLabel("No audio tracks.")
@@ -686,6 +868,16 @@ class ControlPanel(QWidget):
             pass
         # emit unified signal
         self.track_vol_chg.emit(index, value)
+
+    def _on_track_mute_toggled(self, index: int, muted: bool):
+        # Пока дорожка замьючена, её слайдер отключён — так громкость не
+        # "спорит" сама с собой между звуком слайдера и состоянием mute.
+        try:
+            _, slider, _ = self._track_widgets[index]
+            slider.setEnabled(not muted)
+        except Exception:
+            pass
+        self.track_mute_chg.emit(index, muted)
 
     # convenience helpers used by MainWindow
     def set_timeline_range(self, maximum):
@@ -716,6 +908,9 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.settings = load_settings()
+        self.extraction_thread = None
+        self.export_thread = None
+        self.normal_geometry = None  # Для сохранения геометрии окна
 
         # ----- Window Setup ----- #
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -737,7 +932,7 @@ class MainWindow(QMainWindow):
         self.title_bar = QWidget()
         self.title_bar.setMinimumHeight(0)
         self.title_bar.setMaximumHeight(30)
-        self.title_label = QLabel("Crusty Media Player v1.3.0")
+        self.title_label = QLabel("Crusty Media Player v1.4.0")
         self.title_label.setObjectName("titlelabel")
 
         self.settings_button = QToolButton()
@@ -752,18 +947,31 @@ class MainWindow(QMainWindow):
         # File submenu
         file_menu = QMenu("File", self)
         self.export_action = file_menu.addAction("Export Video with Audio Mix...", self.export_video)
+        self.recent_menu = QMenu("Open Recent", self)
+        file_menu.addMenu(self.recent_menu)
         self.settings_menu.addMenu(file_menu)
+        self.rebuild_recent_menu()
 
         # Appearance submenu
         appearance_menu = QMenu("Appearance", self)
         self.light_mode_action = appearance_menu.addAction("Light Mode", lambda: self.apply_theme("light"))
         self.light_mode_action.setCheckable(True)
-        self.light_mode_action.setChecked(self.settings.get("theme") == "light")
-
+        
         self.dark_mode_action = appearance_menu.addAction("Dark Mode", lambda: self.apply_theme("dark"))
         self.dark_mode_action.setCheckable(True)
-        self.dark_mode_action.setChecked(self.settings.get("theme") == "dark")
-
+        self.theme_action_group = QActionGroup(self)
+        self.theme_action_group.setExclusive(True)
+        self.theme_action_group.addAction(self.light_mode_action)
+        self.theme_action_group.addAction(self.dark_mode_action)
+        
+        # Устанавливаем правильное состояние галочек
+        if self.settings.get("theme") == "light":
+            self.light_mode_action.setChecked(True)
+            self.dark_mode_action.setChecked(False)
+        else:
+            self.light_mode_action.setChecked(False)
+            self.dark_mode_action.setChecked(True)
+            
         self.settings_menu.addMenu(appearance_menu)
 
         # Control Panel submenu
@@ -795,15 +1003,29 @@ class MainWindow(QMainWindow):
         self.remember_volumes_action.setChecked(self.settings.get("remember_volumes", False))
 
         control_panel_menu.addSeparator()
+        
+        # Auto hide controls
+        self.auto_hide_action = control_panel_menu.addAction(
+            "✓ Auto-hide Controls" if self.settings.get("auto_hide_controls", True) else "x Auto-hide Controls",
+            self.toggle_auto_hide
+        )
+        self.auto_hide_action.setCheckable(True)
+        self.auto_hide_action.setChecked(self.settings.get("auto_hide_controls", True))
+
+        hide_delay_menu = QMenu("Hide Delay", self)
+        self.hide_delay_group = QActionGroup(self)
+        self.hide_delay_group.setExclusive(True)
+        self.hide_delay_actions = {}
+        for ms, label in [(1000, "1 second"), (2000, "2 seconds"), (3000, "3 seconds"), (5000, "5 seconds"), (10000, "10 seconds")]:
+            action = hide_delay_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.settings.get("hide_delay", 2000) == ms)
+            action.triggered.connect(lambda checked=False, value=ms: self.set_hide_delay(value))
+            self.hide_delay_group.addAction(action)
+            self.hide_delay_actions[ms] = action
+        control_panel_menu.addMenu(hide_delay_menu)
 
         # Startup behavior
-        self.hide_controls_action = control_panel_menu.addAction(
-            "✓ Hide Controls on Start" if self.settings.get("hide_controls_on_start") else "x Hide Controls on Start",
-            self.toggle_hide_controls_on_start
-        )
-        self.hide_controls_action.setCheckable(True)
-        self.hide_controls_action.setChecked(self.settings.get("hide_controls_on_start", False))
-
         self.fullscreen_start_action = control_panel_menu.addAction(
             "✓ Fullscreen on Start" if self.settings.get("fullscreen_on_start") else "x Fullscreen on Start",
             self.toggle_fullscreen_on_start
@@ -861,6 +1083,17 @@ class MainWindow(QMainWindow):
         self.is_scrubbing = False
         self.controls_visible = True
         self.current_video_path = None  # Store the currently loaded video path
+        self._detected_resolution = None
+        self._pending_seek = None
+        self.mouse_in_controls = False  # Флаг для отслеживания наведения на контролы
+
+        # ----- Живой предпросмотр кадра при перетаскивании ползунка ----- #
+        self._pending_scrub_pos = None
+        self.scrub_timer = QTimer(self)
+        self.scrub_timer.setSingleShot(True)
+        self.scrub_timer.setInterval(16)  # ~60 обновлений/сек — плавно, но без флуда seek-ами
+        self.scrub_timer.timeout.connect(self._apply_scrub_seek)
+
 
         # ----- Animations ----- #
         QApplication.processEvents()
@@ -879,8 +1112,10 @@ class MainWindow(QMainWindow):
         self.title_target_height = self.title_bar.height()
         self.title_bar.setMaximumHeight(self.title_target_height)
 
+        # Настройка таймера скрытия
+        hide_delay = self.settings.get("hide_delay", 2000)
         self.hide_timer = QTimer(self)
-        self.hide_timer.setInterval(3000)
+        self.hide_timer.setInterval(hide_delay)
         self.hide_timer.timeout.connect(self.hide_controls)
 
         # ----- Mouse Tracking ----- #
@@ -889,13 +1124,24 @@ class MainWindow(QMainWindow):
         self.setMouseTracking(True)
         self.video.video_widget.setMouseTracking(True)
         self.video.video_widget.installEventFilter(self)
+        self.video.installEventFilter(self)
+        self.video.video_widget.setAcceptDrops(True)
+        self.video.setAcceptDrops(True)
         self.controls.setMouseTracking(True)
+        self.controls.setAcceptDrops(True)
+        self.title_bar.setAcceptDrops(True)
         self.title_bar.setMouseTracking(True)
         QApplication.instance().installEventFilter(self)
 
         # ----- Space key for play/pause ----- #
         space_shortcut = QShortcut(Qt.Key.Key_Space, self)
         space_shortcut.activated.connect(self.toggle_play_pause)
+        
+        # ----- F key for fullscreen ----- #
+        self.fullscreen_shortcut = QShortcut(Qt.Key.Key_F, self)
+        self.fullscreen_shortcut.activated.connect(self.toggle_maximize)
+        self.controls_shortcut = QShortcut(Qt.Key.Key_H, self)
+        self.controls_shortcut.activated.connect(self.toggle_controls_visibility)
 
         # ----- Timer for timeline updates ----- #
         self.timer = QTimer()
@@ -905,9 +1151,6 @@ class MainWindow(QMainWindow):
         self.was_playing = False
 
         # Apply startup preferences
-        if self.settings.get("hide_controls_on_start", False):
-            QTimer.singleShot(100, self.hide_controls)
-
         if self.settings.get("fullscreen_on_start", False):
             QTimer.singleShot(100, self.toggle_maximize)
 
@@ -922,9 +1165,13 @@ class MainWindow(QMainWindow):
 
         # unified track signal -> handler
         self.controls.track_vol_chg.connect(self.set_track_vol)
+        self.controls.track_mute_chg.connect(self.set_track_mute)
 
-        # ----- Connections to audio manager ----- #
-        self.audio.audio_tracks_detected.connect(self.update_vol_ui)
+        # Примечание: update_vol_ui подключается к каждому AudioExtractorThread
+        # индивидуально в load_video_common — так он вызывается ровно один раз
+        # на загрузку, а не дважды (раньше self.audio.audio_tracks_detected тоже
+        # был подключён здесь напрямую, и оба сигнала срабатывали на одно и то же
+        # событие, пересоздавая виджеты дорожек лишний раз).
 
         # ----- Connections to video player ----- #
         self.video.position_changed.connect(self.vid_pos_chg)
@@ -933,14 +1180,36 @@ class MainWindow(QMainWindow):
 
     # ----- Event filter / UI hide logic ----- #
     def eventFilter(self, obj, event):
-        if obj == self.video.video_widget and event.type() == QEvent.Type.MouseButtonDblClick:
-            self.toggle_maximize()
-            return True
-
-        if obj == self.video.video_widget and event.type() == QEvent.Type.MouseButtonPress:
-            if event.button() == Qt.MouseButton.LeftButton:
-                self.toggle_play_pause()
+        if obj in (self.video, self.video.video_widget):
+            if event.type() == QEvent.Type.DragEnter:
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                    return True
+            elif event.type() == QEvent.Type.Drop:
+                urls = event.mimeData().urls()
+                if urls:
+                    file_path = urls[0].toLocalFile()
+                    video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.ogg', '.mpeg', '.mpg', '.wmv', '.flv')
+                    if file_path.lower().endswith(video_extensions):
+                        self.load_video_from_path(file_path)
+                        event.acceptProposedAction()
+                        return True
+                event.ignore()
                 return True
+            elif event.type() == QEvent.Type.MouseButtonDblClick:
+                self.toggle_maximize()
+                return True
+            elif event.type() == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    # Край окна всегда имеет приоритет над кликом по видео.
+                    global_pos = event.globalPosition().toPoint()
+                    local_pos = self.mapFromGlobal(global_pos)
+                    edge = self.get_resize_edge(local_pos)
+                    if edge:
+                        self.windowHandle().startSystemResize(edge)
+                        return True
+                    self.toggle_play_pause()
+                    return True
 
         if event.type() == QEvent.Type.MouseMove:
             self.reset_hide_timer()
@@ -948,13 +1217,34 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def reset_hide_timer(self):
-        self.show_controls()
+        # Показываем контролы всегда при движении мыши, если они скрыты
+        if not self.controls_visible or not self.title_visible:
+            self.show_controls()
 
-        widget_under_mouse = QApplication.widgetAt(QCursor.pos())
-        if isinstance(widget_under_mouse, QSlider) or self.is_scrubbing:
+        # Проверяем, находится ли мышь над виджетами, которые должны удерживать панель
+        pos = QCursor.pos()
+        widget_under_mouse = QApplication.widgetAt(pos)
+
+        # Если мышь над панелью управления, ползунком или мы скраббим - не прячем
+        if (widget_under_mouse and (self.controls.isAncestorOf(widget_under_mouse) or
+            self.title_bar.isAncestorOf(widget_under_mouse) or
+            widget_under_mouse == self.controls or widget_under_mouse == self.title_bar)
+            ) or self.is_scrubbing:
             self.hide_timer.stop()
             return
 
+        # Если мышь в нижней части окна (последние 60 пикселей)
+        local_pos = self.mapFromGlobal(pos)
+        if local_pos.y() > self.height() - 60:
+            self.hide_timer.stop()
+            return
+
+        # Проверяем, включено ли авто-скрытие
+        if not self.settings.get("auto_hide_controls", True):
+            self.hide_timer.stop()
+            return
+
+        # Запускаем таймер, только если видео играет
         if self.is_playing:
             self.hide_timer.start()
         else:
@@ -976,9 +1266,31 @@ class MainWindow(QMainWindow):
             self.title_visible = True
 
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.hide_timer.stop()
 
     def hide_controls(self):
-        if not self.controls_visible or self.is_scrubbing:
+        # Не прячем, если мы скраббим или если видео не играет
+        if self.is_scrubbing or not self.is_playing:
+            return
+
+        # Проверяем, включено ли авто-скрытие
+        if not self.settings.get("auto_hide_controls", True):
+            return
+
+        # Не прячем, если мышь находится над областью плеера
+        pos = QCursor.pos()
+        widget_under_mouse = QApplication.widgetAt(pos)
+        if widget_under_mouse and (self.controls.isAncestorOf(widget_under_mouse) or
+                                   self.title_bar.isAncestorOf(widget_under_mouse) or
+                                   widget_under_mouse == self.controls or widget_under_mouse == self.title_bar):
+            return
+
+        # Не прячем, если мышь в нижней части окна
+        local_pos = self.mapFromGlobal(pos)
+        if local_pos.y() > self.height() - 60:
+            return
+
+        if not self.controls_visible:
             return
 
         self.animation.stop()
@@ -1009,6 +1321,17 @@ class MainWindow(QMainWindow):
         if self.settings.get("remember_volumes", False):
             self.settings["saved_volumes"][f"track_{index}"] = value
             save_settings(self.settings)
+
+    def set_track_mute(self, index: int, muted: bool):
+        if muted:
+            self.audio.set_track_vol(index, 0.0)
+        else:
+            # Восстанавливаем громкость по текущему положению слайдера дорожки.
+            try:
+                _, slider, _ = self.controls._track_widgets[index]
+                self.audio.set_track_vol(index, slider.value() / 100.0)
+            except Exception:
+                pass
 
     def apply_saved_volumes(self, saved_volumes):
         """Apply saved volumes to audio players and UI sliders"""
@@ -1047,69 +1370,103 @@ class MainWindow(QMainWindow):
         self.refresh_controls_target_height()
 
     # ----- Loading media and control ----- #
-    def get_video_resolution(self, file_path):
-        try:
-            cmd = [
-                "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "json",
-                file_path
-            ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            data = json.loads(result.stdout)
-            width = int(data["streams"][0]["width"])
-            height = int(data["streams"][0]["height"])
-            return width, height
-        except Exception:
-            return 1280, 720  # fallback default
+    def rebuild_recent_menu(self):
+        self.recent_menu.clear()
+        recent_files = self.settings.get("recent_files", [])
+        if not recent_files:
+            empty_action = self.recent_menu.addAction("(empty)")
+            empty_action.setEnabled(False)
+            return
+        for path in recent_files:
+            label = os.path.basename(path)
+            action = self.recent_menu.addAction(label, partial(self.load_video_from_path, path))
+            action.setToolTip(path)
+        self.recent_menu.addSeparator()
+        self.recent_menu.addAction("Clear Recent", self.clear_recent_files)
+
+    def clear_recent_files(self):
+        self.settings["recent_files"] = []
+        save_settings(self.settings)
+        self.rebuild_recent_menu()
+
+    def add_recent_file(self, file_path):
+        recent_files = self.settings.get("recent_files", [])
+        # Убираем повтор, кладём в начало, ограничиваем длину списка
+        recent_files = [p for p in recent_files if p != file_path]
+        recent_files.insert(0, file_path)
+        self.settings["recent_files"] = recent_files[:8]
+        save_settings(self.settings)
+        self.rebuild_recent_menu()
 
     def load_video(self):
+        start_dir = self.settings.get("last_open_dir", "")
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Video File", "", "Video Files (*.mp4 *.mkv *.avi *.mov)"
+            self, "Select Video File", start_dir,
+            "Video Files (*.mp4 *.mkv *.avi *.mov *.webm *.mpeg *.mpg *.wmv *.flv)"
         )
         if not file_path:
             return
+        self.settings["last_open_dir"] = os.path.dirname(file_path)
+        save_settings(self.settings)
         self.load_video_common(file_path)
 
     def load_video_common(self, file_path):
-        self.current_video_path = file_path  # Store the current video path
-        self.controls.set_info_text(f"Loading audio tracks from:\n{os.path.basename(file_path)}")
+        # Отменяем предыдущий поток, если он был
+        if self.extraction_thread and self.extraction_thread.isRunning():
+            self.extraction_thread.cancel()
+            self.extraction_thread.wait()
+            self.extraction_thread = None
 
         self.audio.cleanup_temp_files()
-
-        try:
-            num_audio_tracks = self.audio.detect_audio_tracks(file_path)
-        except Exception:
-            self.controls.set_info_text("Error reading media file.")
-            return
-
-        self.update_vol_ui(num_audio_tracks)
-        if num_audio_tracks == 0:
-            self.controls.set_info_text("No audio tracks found in the selected file.")
-            return
-
-        # Extract ALL audio tracks (no hard cap)
-        extract = self.audio.extract_audio_tracks(file_path)
-        if len(extract) < 1:
-            self.controls.set_info_text("No audio tracks found in the selected file.")
-            return
-
-        self.video.set_media(file_path)
+        self.current_video_path = file_path
+        self._detected_resolution = None
+        self.add_recent_file(file_path)
+        # Видео загружается сразу и не зависит от наличия аудиодорожек.
+        self.video.set_media(self.current_video_path)
         self.video.set_video_muted()
+        self.controls.set_info_text("Detecting audio tracks...")
 
-        self.audio.set_audio_src()
+        # Создаём и запускаем поток
+        self.extraction_thread = AudioExtractorThread(file_path, self.audio, self)
+        self.extraction_thread.audio_tracks_detected.connect(self.update_vol_ui)
+        self.extraction_thread.video_resolution_detected.connect(self.on_video_resolution_detected)
+        self.extraction_thread.extraction_progress.connect(self.controls.set_info_text)
+        self.extraction_thread.extraction_finished.connect(self.on_extraction_finished)
+        self.extraction_thread.extraction_error.connect(self.on_extraction_error)
+        self.extraction_thread.start()
 
-        # Load saved volumes if setting is enabled
+    def on_video_resolution_detected(self, width, height):
+        # Пришло из фонового потока вместе с детектом аудио — отдельный
+        # синхронный ffprobe-вызов на GUI-потоке больше не нужен.
+        self._detected_resolution = (width, height)
+        
+    def on_extraction_error(self, error_msg):
+        # Ошибка аудио не должна блокировать воспроизведение видео.
+        self.controls.set_info_text(f"Video loaded. Audio unavailable: {error_msg}")
+        self.extraction_thread = None
+        
+    def on_extraction_finished(self, temp_files):
+        # Этот метод вызывается, когда извлечение завершено
+        self.controls.set_info_text(f"Loaded {len(temp_files)} audio track(s). Click Play.")
+
+        # Видео уже настроено до запуска фонового извлечения.
+        # Аудиоплееры подготовлены в AudioManager; повторно назначаем источники.
+        if temp_files:
+            self.audio.setup_audio_players()
+            self.audio.set_audio_src()
+        else:
+            self.controls.set_info_text("Video loaded (no audio tracks). Click Play.")
+
+        # Загружаем сохранённые громкости
         if self.settings.get("remember_volumes", False):
             saved_volumes = self.settings.get("saved_volumes", {})
             QTimer.singleShot(250, lambda: self.apply_saved_volumes(saved_volumes))
 
+        # Изменяем размер окна
         screen_geom = QApplication.primaryScreen().availableGeometry()
         screen_width, screen_height = screen_geom.width(), screen_geom.height()
 
-        video_width, video_height = self.get_video_resolution(file_path)
+        video_width, video_height = self._detected_resolution or (1280, 720)
         total_height = video_height + self.controls.sizeHint().height() + self.title_bar.height()
         total_width = video_width
 
@@ -1117,10 +1474,9 @@ class MainWindow(QMainWindow):
         max_width = int(screen_width * MARGIN_FACTOR)
         max_height = int(screen_height * MARGIN_FACTOR)
 
-        # Calculate scaling factor if video is larger than screen
         scale_w = max_width / total_width if total_width > 0 else 1.0
         scale_h = max_height / total_height if total_height > 0 else 1.0
-        scale = min(scale_w, scale_h, 1.0)  # Don't upscale; only downscale
+        scale = min(scale_w, scale_h, 1.0)
 
         new_width = int(total_width * scale)
         new_height = int(total_height * scale)
@@ -1129,10 +1485,12 @@ class MainWindow(QMainWindow):
             self.resize(new_width, new_height)
             self.center_window()
 
-        self.controls.set_info_text(f"Loaded {len(self.audio.temp_files)} audio track(s). Click Play.")
-
+        # Обновляем длительность, если она уже известна
         if self.video.dur() > 0:
             self.update_dur(self.video.dur())
+
+        # Освобождаем поток
+        self.extraction_thread = None
 
     def load_video_from_path(self, file_path):
         if not file_path or not os.path.exists(file_path):
@@ -1161,13 +1519,15 @@ class MainWindow(QMainWindow):
         self.video.play()
         self.audio.play()
         self.timer.start()
-        self.hide_timer.start()
+        # Таймер скрытия запускается только после паузы в движении мыши
+        self.reset_hide_timer()
 
     def pause(self):
         self.video.pause()
         self.audio.pause()
         self.timer.stop()
         self.hide_timer.stop()
+        # Обязательно показываем контролы при паузе
         self.show_controls()
 
     def stop(self):
@@ -1182,6 +1542,7 @@ class MainWindow(QMainWindow):
 
     # ----- Scrubbing ----- #
     def update_dur(self, dur):
+        dur = max(0, int(dur))
         self.controls.set_timeline_range(dur)
         self.controls.set_timeline_label(f"00:00 / {self.update_label(dur)}")
 
@@ -1190,8 +1551,15 @@ class MainWindow(QMainWindow):
             return
 
         pos = self.video.pos()
-        dur = self.video.dur()
-        self.controls.set_timeline_value_blocked(pos)
+        dur = self.controls.timeline_slider.maximum() or self.video.dur()
+        # Some Qt backends report a position beyond their seekable range briefly;
+        # keep the UI stable but never overwrite a valid end seek with a stale value.
+        if self._pending_seek is not None and abs(pos - self._pending_seek) > 2000:
+            self.video.set_pos(self._pending_seek)
+            return
+        if self._pending_seek is not None and abs(pos - self._pending_seek) <= 2000:
+            self._pending_seek = None
+        self.controls.set_timeline_value_blocked(min(pos, self.controls.timeline_slider.maximum()))
         self.controls.set_timeline_label(f"{self.update_label(pos)} / {self.update_label(dur)}")
 
     def update_label(self, ms):
@@ -1219,6 +1587,17 @@ class MainWindow(QMainWindow):
         dur = self.video.dur()
         self.controls.set_timeline_label(f"{self.update_label(pos)} / {self.update_label(dur)}")
 
+        # Живое обновление картинки видео при перетаскивании ползунка (как на YouTube).
+        # Троттлим через таймер, чтобы не заваливать декодер seek-запросами при быстром
+        # движении мыши — берём только самую последнюю позицию.
+        self._pending_scrub_pos = pos
+        if not self.scrub_timer.isActive():
+            self.scrub_timer.start()
+
+    def _apply_scrub_seek(self):
+        if self.is_scrubbing and self._pending_scrub_pos is not None:
+            self.video.set_pos(self._pending_scrub_pos)
+
     def start_scrub(self):
         self.was_playing = self.video.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         self.is_scrubbing = True
@@ -1229,8 +1608,12 @@ class MainWindow(QMainWindow):
 
     def end_scrub(self):
         self.is_scrubbing = False
+        self.scrub_timer.stop()
+        self._pending_scrub_pos = None
         pos = self.controls.timeline_slider.value()
 
+        pos = min(pos, max(0, self.controls.timeline_slider.maximum() - 1))
+        self._pending_seek = pos
         self.video.set_pos(pos)
         self.audio.set_pos(pos)
 
@@ -1250,6 +1633,49 @@ class MainWindow(QMainWindow):
         if not playing:
             self.show_controls()
 
+    def keyPressEvent(self, event):
+        key = event.key()
+        native = event.nativeVirtualKey() if hasattr(event, "nativeVirtualKey") else 0
+        # Physical A/D keys on Windows, independent of keyboard layout.
+        if native in (0x41, 0x44) or key in (Qt.Key.Key_A, Qt.Key.Key_D):
+            delta = -5000 if native == 0x41 or key == Qt.Key.Key_A else 5000
+            self.seek_relative(delta)
+            event.accept()
+            return
+        # Physical comma/period keys (< and >), independent of layout/Shift.
+        if native in (0xBC, 0xBE) and not self.is_playing:
+            self.seek_frame(-1 if native == 0xBC else 1)
+            event.accept()
+            return
+        if key in (Qt.Key.Key_Less, Qt.Key.Key_Greater, Qt.Key.Key_Comma, Qt.Key.Key_Period) and not self.is_playing:
+            self.seek_frame(-1 if key in (Qt.Key.Key_Less, Qt.Key.Key_Comma) else 1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def seek_relative(self, delta):
+        dur = self.controls.timeline_slider.maximum() or self.video.dur()
+        if dur <= 0:
+            return
+        pos = max(0, min(max(0, dur - 1), self.video.pos() + delta))
+        self._pending_seek = pos
+        self.video.set_pos(pos)
+        self.audio.set_pos(pos)
+        self.controls.set_timeline_value_blocked(pos)
+
+    def seek_frame(self, direction):
+        # Qt Multimedia has no universal frame-step API; use a small timestamp step
+        # while paused and force the player to remain paused.
+        if self.is_playing:
+            return
+        step = 40
+        dur = self.controls.timeline_slider.maximum() or self.video.dur()
+        target = max(0, min(max(0, dur - 1), self.video.pos() + direction * step))
+        self.video.set_pos(target)
+        self.audio.set_pos(target)
+        self.controls.set_timeline_value_blocked(target)
+        QTimer.singleShot(30, self.video.pause)
+
     # ----- Resize/Drag window behavior ----- #
     def center_window(self):
         screen = QApplication.primaryScreen().geometry()
@@ -1261,7 +1687,14 @@ class MainWindow(QMainWindow):
         if self.isFullScreen():
             self.showNormal()
             self.maximize_button.setText("^")
+            # Восстанавливаем сохранённую геометрию, если она есть
+            if self.normal_geometry:
+                # Восстанавливаем позицию и размер
+                self.setGeometry(self.normal_geometry)
+                self.normal_geometry = None
         else:
+            # Сохраняем текущую геометрию перед переходом в полноэкранный режим
+            self.normal_geometry = self.geometry()
             self.showFullScreen()
             self.maximize_button.setText("v")
 
@@ -1270,13 +1703,15 @@ class MainWindow(QMainWindow):
         x, y = pos.x(), pos.y()
         w, h = self.width(), self.height()
 
-        if self.isMaximized():
+        if self.isMaximized() or self.isFullScreen():
             return 0
 
-        on_left = x < BORDER_SIZE
-        on_right = x > w - BORDER_SIZE
-        on_top = y < BORDER_SIZE
-        on_bottom = y > h - BORDER_SIZE
+        # Увеличиваем зону для захвата края
+        border = BORDER_SIZE
+        on_left = x < border
+        on_right = x > w - border
+        on_top = y < border
+        on_bottom = y > h - border
 
         if on_top and on_left:
             return Qt.Edge.TopEdge | Qt.Edge.LeftEdge
@@ -1306,6 +1741,7 @@ class MainWindow(QMainWindow):
                 self.windowHandle().startSystemResize(edge)
                 return
 
+            # Проверяем, что клик был по заголовку
             title_bar_rect = self.title_bar.geometry()
             if title_bar_rect.contains(event.pos()):
                 self.dragPos = event.globalPosition().toPoint()
@@ -1313,28 +1749,30 @@ class MainWindow(QMainWindow):
                 self.dragPos = QPoint()
 
     def mouseMoveEvent(self, event):
-        # Check for snap to fullscreen (drag to top of screen)
+        # Проверка на ресайз и перетаскивание
         if event.buttons() == Qt.MouseButton.LeftButton and self.dragPos != QPoint():
             new_pos = self.pos() + event.globalPosition().toPoint() - self.dragPos
-    
-            # Check if window is being dragged to top of screen
-            if new_pos.y() <= 0 and not self.isFullScreen():
-                self.showFullScreen()
-                self.maximize_button.setText("v")
+
+            # Полноэкранный режим не включается автоматически при касании верхнего края.
+            if self.isFullScreen():
+                # Потянуть верхнюю панель вниз: восстановить прежний размер.
+                if event.globalPosition().toPoint().y() > 20:
+                    self.toggle_maximize()
+                    self.dragPos = event.globalPosition().toPoint()
+                return
+
+            # При перетаскивании верхней панели к верхнему краю включаем настоящий fullscreen.
+            if new_pos.y() <= 0:
+                self.toggle_maximize()
                 self.dragPos = QPoint()
                 return
-    
+            # Стандартное перетаскивание
             self.move(new_pos)
             self.dragPos = event.globalPosition().toPoint()
             return
 
+        # Сброс таймера при движении мыши
         self.reset_hide_timer()
-
-        # Dragging Check
-        if event.buttons() == Qt.MouseButton.LeftButton and self.dragPos != QPoint():
-            self.move(self.pos() + event.globalPosition().toPoint() - self.dragPos)
-            self.dragPos = event.globalPosition().toPoint()
-            return
 
         # Resizing Cursor Check
         if not (event.buttons() & Qt.MouseButton.LeftButton) and not self.isMaximized():
@@ -1366,8 +1804,12 @@ class MainWindow(QMainWindow):
         # Apply the chosen theme and remember it
         if theme == "dark":
             QApplication.instance().setStyleSheet(DARK_THEME)
+            self.dark_mode_action.setChecked(True)
+            self.light_mode_action.setChecked(False)
         else:
             QApplication.instance().setStyleSheet(LIGHT_THEME)
+            self.light_mode_action.setChecked(True)
+            self.dark_mode_action.setChecked(False)
         save_theme(theme)
 
     def set_slider_orientation(self, orientation):
@@ -1377,12 +1819,12 @@ class MainWindow(QMainWindow):
     
         self.horizontal_slider_action.setChecked(orientation == "horizontal")
         self.horizontal_slider_action.setText(
-        "● Horizontal Sliders" if orientation == "horizontal" else "○ Horizontal Sliders"
+            "● Horizontal Sliders" if orientation == "horizontal" else "○ Horizontal Sliders"
         )
     
         self.vertical_slider_action.setChecked(orientation == "vertical")
         self.vertical_slider_action.setText(
-        "● Vertical Sliders" if orientation == "vertical" else "○ Vertical Sliders"
+            "● Vertical Sliders" if orientation == "vertical" else "○ Vertical Sliders"
         )
     
         num_tracks = len(self.audio.audio_players)
@@ -1400,16 +1842,34 @@ class MainWindow(QMainWindow):
             "✓ Remember Volume Levels" if new_value else "x Remember Volume Levels"
         )
 
-    def toggle_hide_controls_on_start(self):
-        """Toggle hide controls on start setting"""
-        current = self.settings.get("hide_controls_on_start", False)
-        new_value = not current
-        self.settings["hide_controls_on_start"] = new_value
+    def set_hide_delay(self, milliseconds):
+        self.settings["hide_delay"] = milliseconds
         save_settings(self.settings)
-        self.hide_controls_action.setChecked(new_value)
-        self.hide_controls_action.setText(
-            "✓ Hide Controls on Start" if new_value else "x Hide Controls on Start"
+        self.hide_timer.setInterval(milliseconds)
+        for value, action in self.hide_delay_actions.items():
+            action.setChecked(value == milliseconds)
+
+    def toggle_controls_visibility(self):
+        if self.controls_visible or self.title_visible:
+            self.hide_timer.stop()
+            self.animation.stop(); self.animation.setStartValue(self.controls.maximumHeight()); self.animation.setEndValue(0); self.animation.start()
+            self.title_animation.stop(); self.title_animation.setStartValue(self.title_bar.maximumHeight()); self.title_animation.setEndValue(0); self.title_animation.start()
+            self.controls_visible = False; self.title_visible = False
+        else:
+            self.show_controls()
+
+    def toggle_auto_hide(self):
+        """Toggle auto-hide controls setting"""
+        current = self.settings.get("auto_hide_controls", True)
+        new_value = not current
+        self.settings["auto_hide_controls"] = new_value
+        save_settings(self.settings)
+        self.auto_hide_action.setChecked(new_value)
+        self.auto_hide_action.setText(
+            "✓ Auto-hide Controls" if new_value else "x Auto-hide Controls"
         )
+        if not new_value:
+            self.show_controls()
 
     def toggle_fullscreen_on_start(self):
         """Toggle fullscreen on start setting"""
@@ -1423,50 +1883,53 @@ class MainWindow(QMainWindow):
         )
 
     def export_video(self):
-        """Export video with mixed audio tracks using ffmpeg"""
+        """Export video with mixed audio tracks using ffmpeg (runs in background thread)"""
+        from PyQt6.QtWidgets import QMessageBox
+
         # Check if a video is loaded
         if not self.current_video_path or not os.path.exists(self.current_video_path):
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "No Video Loaded", "Please load a video file before exporting.")
             return
-        
+
+        if self.export_thread and self.export_thread.isRunning():
+            QMessageBox.warning(self, "Export In Progress", "An export is already running. Please wait for it to finish.")
+            return
+
         # Check if there are audio tracks
         num_tracks = len(self.audio.audio_players)
         if num_tracks == 0:
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "No Audio Tracks", "The current video has no audio tracks to mix.")
             return
-        
+
         # Get output file path from user
         default_name = os.path.splitext(os.path.basename(self.current_video_path))[0] + "_mixed.mp4"
         output_path, _ = QFileDialog.getSaveFileName(
-            self, 
-            "Export Video As", 
+            self,
+            "Export Video As",
             default_name,
             "MP4 Files (*.mp4);;MKV Files (*.mkv);;All Files (*.*)"
         )
-        
+
         if not output_path:
             return  # User cancelled
-        
+
         # Pause playback during export
         was_playing = self.is_playing
         if was_playing:
             self.pause()
-        
+
         # Show progress message
         self.controls.set_info_text("Exporting video... This may take a while.")
-        QApplication.processEvents()
-        
+
         try:
             # Build ffmpeg command
             # Start with input video
             cmd = ["ffmpeg", "-i", self.current_video_path]
-            
+
             # Add all audio track files as inputs
             for temp_file in self.audio.temp_files:
                 cmd.extend(["-i", temp_file])
-            
+
             # Build filter_complex for audio mixing with volume adjustments
             filter_parts = []
             for i in range(num_tracks):
@@ -1478,19 +1941,19 @@ class MainWindow(QMainWindow):
                     volume = slider_value / 25.0
                 except Exception:
                     volume = 1.0  # Default to normal volume if error
-                
+
                 # Audio input index is i+1 (video is 0, first audio is 1, etc.)
                 filter_parts.append(f"[{i+1}:a]volume={volume}[a{i}]")
-            
+
             # Mix all adjusted audio streams
             mix_inputs = "".join([f"[a{i}]" for i in range(num_tracks)])
             filter_parts.append(f"{mix_inputs}amix=inputs={num_tracks}:duration=longest[aout]")
-            
+
             filter_complex = ";".join(filter_parts)
-            
+
             # Add filter_complex to command
             cmd.extend(["-filter_complex", filter_complex])
-            
+
             # Map video from first input and mixed audio
             cmd.extend([
                 "-map", "0:v",      # Video from first input
@@ -1501,44 +1964,43 @@ class MainWindow(QMainWindow):
                 "-y",               # Overwrite output file if exists
                 output_path
             ])
-            
-            # Run ffmpeg
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.information(
-                    self, 
-                    "Export Complete", 
-                    f"Video exported successfully to:\n{output_path}"
-                )
-                self.controls.set_info_text(f"Export complete! Saved to:\n{os.path.basename(output_path)}")
-            else:
-                from PyQt6.QtWidgets import QMessageBox
-                error_msg = result.stderr[-500:] if result.stderr else "Unknown error"
-                QMessageBox.critical(
-                    self, 
-                    "Export Failed", 
-                    f"FFmpeg export failed:\n{error_msg}"
-                )
-                self.controls.set_info_text("Export failed. Check console for details.")
-                print("FFmpeg error:", result.stderr)
-        
+
+            # Запускаем ffmpeg в фоновом потоке, чтобы окно не зависало на время экспорта.
+            self.export_thread = ExportThread(cmd, output_path, self)
+            self.export_thread.export_finished.connect(partial(self.on_export_finished, was_playing))
+            self.export_thread.start()
+
         except Exception as e:
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Export Error", f"An error occurred during export:\n{str(e)}")
             self.controls.set_info_text(f"Export error: {str(e)}")
             print("Export exception:", e)
-        
-        finally:
-            # Resume playback if it was playing before
             if was_playing:
                 self.play()
+
+    def on_export_finished(self, was_playing, success, message):
+        from PyQt6.QtWidgets import QMessageBox
+        if success:
+            output_path = message
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Video exported successfully to:\n{output_path}"
+            )
+            self.controls.set_info_text(f"Export complete! Saved to:\n{os.path.basename(output_path)}")
+        else:
+            error_msg = message
+            QMessageBox.critical(
+                self,
+                "Export Failed",
+                f"FFmpeg export failed:\n{error_msg}"
+            )
+            self.controls.set_info_text("Export failed. Check console for details.")
+            print("FFmpeg error:", error_msg)
+
+        self.export_thread = None
+        # Resume playback if it was playing before
+        if was_playing:
+            self.play()
 
     def rebuild_volume_controls(self, num_tracks):
         """Rebuild volume controls with current orientation"""
@@ -1561,6 +2023,14 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.hide_timer.stop()
 
+        if self.extraction_thread and self.extraction_thread.isRunning():
+            self.extraction_thread.cancel()
+            self.extraction_thread.wait()
+
+        if self.export_thread and self.export_thread.isRunning():
+            self.export_thread.terminate()
+            self.export_thread.wait()
+
         self.video.stop()
         self.video.media_player.setVideoOutput(None)
         self.video.media_player.deleteLater()
@@ -1579,9 +2049,11 @@ class MainWindow(QMainWindow):
         urls = event.mimeData().urls()
         if urls:
             file_path = urls[0].toLocalFile()
-            video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.ogg', '.mpeg']
-            if any(file_path.lower().endswith(ext) for ext in video_extensions):
+            video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.ogg', '.mpeg', '.mpg', '.wmv', '.flv')
+            if file_path.lower().endswith(video_extensions):
                 self.load_video_from_path(file_path)
+            else:
+                event.ignore()
 
 # ------------------------------------- __main__ ------------------------------------- #
 if __name__ == "__main__":
