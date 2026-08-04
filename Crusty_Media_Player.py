@@ -17,6 +17,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtGui import QShortcut, QCursor, QPainter, QAction, QActionGroup, QActionGroup
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+
+# Name used for the single-instance IPC channel (see __main__).
+SINGLE_INSTANCE_KEY = "CrustyMediaPlayer_SingleInstance"
 
 # ----------------------------- Settings & Themes ----------------------------- #
 
@@ -770,8 +774,12 @@ class ControlPanel(QWidget):
             self.track_controls_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.track_controls_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             # Let the content size itself naturally - no constraints
-            self.track_controls_area.setMinimumHeight(150)
-            self.track_controls_area.setMaximumHeight(240)
+            # NOTE: each column stacks a label + slider (up to 200px) + volume
+            # label + Mute checkbox, plus layout spacing/margins. The old cap
+            # of 240px was shorter than that stack, so the Mute checkbox at
+            # the bottom got clipped (the scrollbar is intentionally off above).
+            self.track_controls_area.setMinimumHeight(0)
+            self.track_controls_area.setMaximumHeight(16777215)
             self.track_controls_area.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 QSizePolicy.Policy.Minimum  # Take only what content needs
@@ -780,9 +788,12 @@ class ControlPanel(QWidget):
             # Horizontal sliders might need scrolling if many tracks
             self.track_controls_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             self.track_controls_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            # Limit height for horizontal sliders
-            self.track_controls_area.setMinimumHeight(0)
-            self.track_controls_area.setMaximumHeight(200)
+            # No scrolling until more than four tracks.
+            row_height = 42
+            visible_rows = min(num_tracks, 4)
+
+            self.track_controls_area.setMinimumHeight(row_height * visible_rows + 10)
+            self.track_controls_area.setMaximumHeight(row_height * visible_rows + 10)
             self.track_controls_area.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 QSizePolicy.Policy.Preferred
@@ -830,6 +841,9 @@ class ControlPanel(QWidget):
                 self._track_mutes.append(mute_box)
             
             self.track_controls_layout.addWidget(sliders_container)
+            self.track_controls_area.setFixedHeight(
+                sliders_container.sizeHint().height() + 10
+            )
         else:
             # Horizontal sliders (original)
             for i in range(num_tracks):
@@ -932,7 +946,7 @@ class MainWindow(QMainWindow):
         self.title_bar = QWidget()
         self.title_bar.setMinimumHeight(0)
         self.title_bar.setMaximumHeight(30)
-        self.title_label = QLabel("Crusty Media Player v1.4.0")
+        self.title_label = QLabel("Crusty Media Player v1.4.1")
         self.title_label.setObjectName("titlelabel")
 
         self.settings_button = QToolButton()
@@ -1571,7 +1585,7 @@ class MainWindow(QMainWindow):
     def refresh_controls_target_height(self):
         # Recalculate required height now that the contents changed
         QApplication.processEvents()
-        new_target = max(self.controls.sizeHint().height(), 200)
+        new_target = self.controls.sizeHint().height()
 
         self.target_height = new_target
 
@@ -2065,11 +2079,57 @@ if __name__ == "__main__":
     else:
         app.setStyleSheet(LIGHT_THEME)
 
+    incoming_path = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    # ----- Single-instance check ----- #
+    # When the .exe is registered as the handler for video files, double-
+    # clicking a file in Explorer launches a brand new process each time.
+    # To keep everything in one window, try to hand the path off to an
+    # already-running instance first; only start a real UI if we're the
+    # first (or only) instance.
+    handoff_socket = QLocalSocket()
+    handoff_socket.connectToServer(SINGLE_INSTANCE_KEY)
+    if handoff_socket.waitForConnected(500):
+        # Another instance is already running - forward the file path (if
+        # any) to it and quit immediately instead of opening a 2nd window.
+        if incoming_path:
+            handoff_socket.write(os.path.abspath(incoming_path).encode("utf-8"))
+            handoff_socket.flush()
+            handoff_socket.waitForBytesWritten(1000)
+        handoff_socket.disconnectFromServer()
+        sys.exit(0)
+
+    # We're the first instance: become the server that later launches will
+    # talk to. removeServer() clears a stale socket left behind by a crash.
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    instance_server = QLocalServer()
+    instance_server.listen(SINGLE_INSTANCE_KEY)
+
     player = MainWindow()
 
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
-        player.load_video_from_path(path)
+    def _handle_incoming_connection():
+        conn = instance_server.nextPendingConnection()
+        if conn is None:
+            return
+
+        def _read_forwarded_path():
+            data = bytes(conn.readAll()).decode("utf-8", errors="ignore").strip()
+            if data:
+                player.load_video_from_path(data)
+            # Bring the existing window to the front instead of leaving a
+            # new, separate window behind it.
+            if player.isMinimized():
+                player.showNormal()
+            player.activateWindow()
+            player.raise_()
+            conn.disconnectFromServer()
+
+        conn.readyRead.connect(_read_forwarded_path)
+
+    instance_server.newConnection.connect(_handle_incoming_connection)
+
+    if incoming_path:
+        player.load_video_from_path(incoming_path)
 
     player.show()
     player.activateWindow()
