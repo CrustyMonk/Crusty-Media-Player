@@ -2996,6 +2996,32 @@ QDialog#settings_dialog QComboBox:focus, QDialog#settings_dialog QSpinBox:focus,
     instance_server = QLocalServer()
     instance_server.listen(SINGLE_INSTANCE_KEY)
 
+    incoming_path = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    # ----- Single-instance check ----- #
+    # When the .exe is registered as the handler for video files, double-
+    # clicking a file in Explorer launches a brand new process each time.
+    # To keep everything in one window, try to hand the path off to an
+    # already-running instance first; only start a real UI if we're the
+    # first (or only) instance.
+    handoff_socket = QLocalSocket()
+    handoff_socket.connectToServer(SINGLE_INSTANCE_KEY)
+    if handoff_socket.waitForConnected(500):
+        # Another instance is already running - forward the file path (if
+        # any) to it and quit immediately instead of opening a 2nd window.
+        if incoming_path:
+            handoff_socket.write(os.path.abspath(incoming_path).encode("utf-8"))
+            handoff_socket.flush()
+            handoff_socket.waitForBytesWritten(1000)
+        handoff_socket.disconnectFromServer()
+        sys.exit(0)
+
+    # We're the first instance: become the server that later launches will
+    # talk to. removeServer() clears a stale socket left behind by a crash.
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    instance_server = QLocalServer()
+    instance_server.listen(SINGLE_INSTANCE_KEY)
+
     player = MainWindow()
 
     def _handle_incoming_connection():
