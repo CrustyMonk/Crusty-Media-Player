@@ -25,7 +25,7 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 # Name used for the single-instance IPC channel (see __main__).
 SINGLE_INSTANCE_KEY = "CrustyMediaPlayer_SingleInstance"
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 
 # ----------------------------- Settings & Themes ----------------------------- #
 
@@ -414,19 +414,16 @@ QComboBox::down-arrow {
 # Border detection size
 BORDER_SIZE = 10  # widened for easier grabbing
 
-# Force ffmpeg-python to use bundled ffmpeg.exe if present
+# Force ffmpeg-python to use a bundled ffmpeg if present next to the app
 if getattr(sys, 'frozen', False):
     base_path = sys._MEIPASS
     # sys._MEIPASS is PyInstaller's self-deleting extraction folder - the
     # audio cache needs a location that survives between runs, so use the
-    # real .exe's directory instead.
+    # real executable's directory instead.
     app_dir = os.path.dirname(sys.executable)
 else:
     base_path = os.path.dirname(__file__)
     app_dir = base_path
-
-ffmpeg_path = os.path.join(base_path, 'ffmpeg.exe')
-ffprobe_path = os.path.join(base_path, 'ffprobe.exe')
 
 # Extracted audio tracks are cached here instead of the OS temp dir, so they
 # can be reliably cleaned on our own schedule (see AudioManager.prune_cache_dir)
