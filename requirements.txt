@@ -1,0 +1,14 @@
+# Crusty Media Player - Linux Dependencies
+
+# Core GUI framework
+PyQt6>=6.4.0
+PyQt6-Qt6>=6.4.0
+
+# Audio/video export & probing (the "import ffmpeg" wrapper used by the app)
+ffmpeg-python>=0.2.0
+
+# The ffmpeg *binary* itself is a system package, not pip-installable:
+# Ubuntu/Debian: sudo apt install ffmpeg
+# Fedora:        sudo dnf install ffmpeg
+# Arch/Omarchy:  sudo pacman -S ffmpeg
+# openSUSE:      sudo zypper install ffmpeg

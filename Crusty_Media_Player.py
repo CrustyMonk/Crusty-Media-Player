@@ -27,6 +27,30 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 SINGLE_INSTANCE_KEY = "CrustyMediaPlayer_SingleInstance"
 APP_VERSION = "1.4.4"
 
+
+def running_on_wayland():
+    """True when Qt is using the Wayland platform plugin (not XWayland/xcb).
+
+    Used to work around a Qt 6 bug: resizing this frameless top-level window
+    after a video is loaded (see on_extraction_finished) permanently breaks
+    QVideoWidget's video scaling on Wayland - the video renders far larger
+    than the widget and is clipped, until the window is manually moved or
+    resized. Under a tiling compositor (Hyprland, Sway) the compositor
+    rejects the resize outright, so the auto-fit is useless there anyway.
+    On X11, Windows and macOS the resize works fine and is kept.
+    """
+    if os.name == "nt" or sys.platform == "darwin":
+        return False
+    try:
+        name = QApplication.platformName()
+        if name:
+            return name.lower().startswith("wayland")
+    except Exception:
+        pass
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return os.environ.get("XDG_SESSION_TYPE", "").lower() != "x11"
+    return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+
 # ----------------------------- Settings & Themes ----------------------------- #
 
 def get_settings():
@@ -2239,26 +2263,32 @@ class MainWindow(QMainWindow):
             saved_volumes = self.settings.get("saved_volumes", {})
             QTimer.singleShot(250, lambda: self.apply_saved_volumes(saved_volumes))
 
-        # Resize window to fit the video
-        screen_geom = QApplication.primaryScreen().availableGeometry()
-        screen_width, screen_height = screen_geom.width(), screen_geom.height()
+        # Resize window to fit the video.
+        #
+        # NOT on Wayland: resizing this frameless top-level here permanently
+        # breaks QVideoWidget's video scaling under the Qt 6 Wayland backend
+        # (the video renders oversized and clipped until the window is moved
+        # by hand). Tiling compositors reject the resize anyway, so nothing
+        # is lost. X11 / Windows / macOS keep the auto-fit behaviour.
+        if not self.isFullScreen() and not running_on_wayland():
+            screen_geom = QApplication.primaryScreen().availableGeometry()
+            screen_width, screen_height = screen_geom.width(), screen_geom.height()
 
-        video_width, video_height = self._detected_resolution or (1280, 720)
-        total_height = video_height + self.controls.sizeHint().height() + self.title_bar.height()
-        total_width = video_width
+            video_width, video_height = self._detected_resolution or (1280, 720)
+            total_height = video_height + self.controls.sizeHint().height() + self.title_bar.height()
+            total_width = video_width
 
-        MARGIN_FACTOR = 0.9
-        max_width = int(screen_width * MARGIN_FACTOR)
-        max_height = int(screen_height * MARGIN_FACTOR)
+            MARGIN_FACTOR = 0.9
+            max_width = int(screen_width * MARGIN_FACTOR)
+            max_height = int(screen_height * MARGIN_FACTOR)
 
-        scale_w = max_width / total_width if total_width > 0 else 1.0
-        scale_h = max_height / total_height if total_height > 0 else 1.0
-        scale = min(scale_w, scale_h, 1.0)
+            scale_w = max_width / total_width if total_width > 0 else 1.0
+            scale_h = max_height / total_height if total_height > 0 else 1.0
+            scale = min(scale_w, scale_h, 1.0)
 
-        new_width = int(total_width * scale)
-        new_height = int(total_height * scale)
+            new_width = int(total_width * scale)
+            new_height = int(total_height * scale)
 
-        if not self.isFullScreen():
             self.resize(new_width, new_height)
             self.center_window()
 

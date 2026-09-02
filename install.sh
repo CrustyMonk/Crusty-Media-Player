@@ -21,13 +21,14 @@ if [ "$EUID" -eq 0 ]; then
   exit 1
 fi
 
-# Detect distro
+# Detect distro (for display purposes only - dependency install below is
+# driven by which package manager is actually present, not by name, so any
+# distro or derivative works without needing to be listed explicitly).
 if [ -f /etc/os-release ]; then
   . /etc/os-release
-  DISTRO=$ID
+  DISTRO="${PRETTY_NAME:-$ID}"
 else
-  echo "Cannot detect Linux distribution"
-  exit 1
+  DISTRO="unknown"
 fi
 
 echo "Detected distribution: $DISTRO"
@@ -36,32 +37,49 @@ echo ""
 echo "Step 1: Installing system dependencies..."
 echo ""
 
-case $DISTRO in
-  arch|manjaro|endeavouros)
-    sudo pacman -S --needed python python-pyqt6 python-mpv ffmpeg imagemagick
-    ;;
-  ubuntu|debian|pop|linuxmint)
-    sudo apt update
-    sudo apt install -y python3 python3-pyqt6 python3-mpv ffmpeg imagemagick
-    ;;
-  fedora|rhel|centos)
-    sudo dnf install -y python3 python3-pyqt6 python3-mpv ffmpeg ImageMagick
-    ;;
-  opensuse*)
-    sudo zypper install -y python3 python3-qt6 python3-mpv ffmpeg ImageMagick
-    ;;
-  *)
-    echo "Unsupported distribution: $DISTRO"
-    echo "Please manually install: python3, python3-pyqt6, python3-mpv, ffmpeg, imagemagick"
-    exit 1
-    ;;
-esac
+# Pick the install command based on the first package manager found on PATH.
+# This covers Arch and every Arch derivative (Manjaro, EndeavourOS, Omarchy,
+# Artix, etc.), Debian/Ubuntu derivatives, Fedora/RHEL derivatives, and
+# openSUSE, without needing each distro name enumerated.
+if command -v pacman >/dev/null 2>&1; then
+  sudo pacman -S --needed python python-pyqt6 python-mpv ffmpeg imagemagick
+elif command -v apt >/dev/null 2>&1; then
+  sudo apt update
+  sudo apt install -y python3 python3-pyqt6 python3-mpv ffmpeg imagemagick
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y python3 python3-pyqt6 python3-mpv ffmpeg ImageMagick
+elif command -v zypper >/dev/null 2>&1; then
+  sudo zypper install -y python3 python3-qt6 python3-mpv ffmpeg ImageMagick
+else
+  echo "  ⚠ No supported package manager found (pacman/apt/dnf/zypper)."
+  echo "  Please manually install: python3, PyQt6, ffmpeg, imagemagick"
+  echo "  Then re-run this script - it will pick up from Step 2."
+fi
+
+# ffmpeg-python (the "import ffmpeg" wrapper the app actually needs) isn't
+# packaged by any distro, so it always goes through pip regardless of which
+# branch above ran. python-mpv above is legacy/unused by the current app and
+# kept only for compatibility; safe to ignore if it fails to install.
+if command -v pip3 >/dev/null 2>&1; then
+  pip3 install --break-system-packages ffmpeg-python 2>/dev/null || pip3 install --user ffmpeg-python
+elif command -v pip >/dev/null 2>&1; then
+  pip install --break-system-packages ffmpeg-python 2>/dev/null || pip install --user ffmpeg-python
+else
+  echo "  ⚠ pip not found - install ffmpeg-python manually: pip install ffmpeg-python"
+fi
 
 echo "  ✓ Dependencies installed"
 echo ""
 
 echo "Step 2: Installing application..."
 echo ""
+
+# Remove any previous install first so a reinstall/upgrade never leaves
+# stale files behind (old app.py, leftover assets from an earlier version, etc).
+if [ -d "$INSTALL_DIR" ]; then
+  echo "  Removing previous installation at $INSTALL_DIR..."
+  rm -rf "$INSTALL_DIR"
+fi
 
 # Create install directories
 mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$DESKTOP_DIR"
@@ -72,26 +90,48 @@ mkdir -p "$ICON_BASE/48x48/apps"
 mkdir -p "$ICON_BASE/32x32/apps"
 mkdir -p "$ICON_BASE/16x16/apps"
 
-# Find the Python file
-SRC_PY="$(find . -maxdepth 1 -name "*.py" -type f | head -n 1)"
+# Find the Python file. Sorted (not just "first found") and we bail out if
+# more than one candidate exists, since silently picking one when an old
+# version's .py is still sitting in the same folder could install the wrong
+# one.
+mapfile -t PY_CANDIDATES < <(find . -maxdepth 1 -name "*.py" -type f | sort)
 
-if [ -z "$SRC_PY" ]; then
+if [ ${#PY_CANDIDATES[@]} -eq 0 ]; then
   echo "ERROR: No .py file found in current directory."
+  exit 1
+elif [ ${#PY_CANDIDATES[@]} -gt 1 ]; then
+  echo "ERROR: Multiple .py files found in current directory:"
+  printf '    %s\n' "${PY_CANDIDATES[@]}"
+  echo "  Please remove old/extra .py files and keep only the one you want installed."
   exit 1
 fi
 
+SRC_PY="${PY_CANDIDATES[0]}"
 echo "  Found: $SRC_PY"
 
+# Strip a UTF-8 BOM if present (common when the .py is edited/saved on
+# Windows). Left in place, it becomes an invalid character on whichever
+# line follows once a shebang is prepended below, and Python refuses to
+# run the file with a SyntaxError.
+CLEAN_PY="/tmp/crusty-clean-src.py"
+if [ "$(head -c 3 "$SRC_PY" | od -An -tx1 | tr -d ' ')" == "efbbbf" ]; then
+  echo "  ⚠ BOM detected in source file - stripping..."
+  tail -c +4 "$SRC_PY" > "$CLEAN_PY"
+else
+  cp -f "$SRC_PY" "$CLEAN_PY"
+fi
+
 # Check and add shebang if needed
-FIRST_LINE=$(head -n 1 "$SRC_PY")
+FIRST_LINE=$(head -n 1 "$CLEAN_PY")
 if [[ "$FIRST_LINE" == "#!/"* ]]; then
   echo "  ✓ Has shebang"
-  cp -f "$SRC_PY" "$INSTALL_DIR/app.py"
+  cp -f "$CLEAN_PY" "$INSTALL_DIR/app.py"
 else
   echo "  ⚠ Missing shebang - adding..."
   echo '#!/usr/bin/env python3' > "$INSTALL_DIR/app.py"
-  cat "$SRC_PY" >> "$INSTALL_DIR/app.py"
+  cat "$CLEAN_PY" >> "$INSTALL_DIR/app.py"
 fi
+rm -f "$CLEAN_PY"
 
 chmod +x "$INSTALL_DIR/app.py"
 echo "  ✓ App installed to $INSTALL_DIR/app.py"
