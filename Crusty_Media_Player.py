@@ -440,19 +440,36 @@ BORDER_SIZE = 10  # widened for easier grabbing
 
 # Force ffmpeg-python to use a bundled ffmpeg if present next to the app
 if getattr(sys, 'frozen', False):
+    # PyInstaller's self-deleting extraction folder - bundled ffmpeg/ffprobe
+    # live here. Not a place to keep anything between runs.
     base_path = sys._MEIPASS
-    # sys._MEIPASS is PyInstaller's self-deleting extraction folder - the
-    # audio cache needs a location that survives between runs, so use the
-    # real executable's directory instead.
-    app_dir = os.path.dirname(sys.executable)
 else:
     base_path = os.path.dirname(__file__)
-    app_dir = base_path
+
+
+def get_cache_dir():
+    """Per-user, always-writable cache location.
+
+    The audio cache must NOT live next to the executable: on Windows the app
+    is normally installed under Program Files, which is read-only for a
+    non-elevated process, and on Linux it may sit in a system path too. Use
+    the platform's standard per-user cache dir instead.
+    """
+    app_name = "CrustyMediaPlayer"
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = os.getenv("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    cache_dir = os.path.join(base, app_name)
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
 
 # Extracted audio tracks are cached here instead of the OS temp dir, so they
 # can be reliably cleaned on our own schedule (see AudioManager.prune_cache_dir)
 # regardless of how the OS temp dir behaves or whether a previous run crashed.
-AUDIO_CACHE_DIR = os.path.join(app_dir, "audio_cache")
+AUDIO_CACHE_DIR = os.path.join(get_cache_dir(), "audio_cache")
 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
 # Add to PATH so subprocess ffmpeg/ffprobe calls find them
